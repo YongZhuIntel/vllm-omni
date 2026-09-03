@@ -75,6 +75,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "LingbotVlaV2Pipeline": (
+        "lingbot_vla_v2",
+        "pipeline_lingbot_vla_v2",
+        "LingbotVlaV2Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",

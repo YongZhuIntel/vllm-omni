@@ -39,6 +39,12 @@ th {
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` |
 
+## Additional Models for Intel XPU
+
+| Architecture | Models | Example |
+|--------------|--------|---------|
+| `LingbotVlaV2Pipeline` | LingBot-VLA 2.0 robot policy | <gh-file:examples/offline_inference/lingbot_vla_v2/README.md> |
+
 
 ## List of Supported Models for NPU
 
