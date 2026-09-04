@@ -96,11 +96,16 @@ class LingbotVlaV2Config:
     use_shared_expert_gate: bool = False
     # Loss-free MoE balancing; training-only, must be 0 at inference.
     bias_update_speed: float = 0.0
-    # "gather" runs each expert on its routed tokens only (~8x less arithmetic at
-    # top-4 of 32); "dense" runs every expert on every token and zero-weights the
-    # rest, which is the upstream eager path the fp32 golden was produced with.
-    # Same value up to fp32 summation order.
-    moe_implementation: str = "gather"
+    # "dense" runs every expert on every token and zero-weights the rest — three
+    # einsums per layer, and the upstream eager path the fp32 golden was produced
+    # with. "gather" runs each expert on only its routed tokens: ~8x less
+    # arithmetic at top-4 of 32, but as a Python loop over all 32 experts it is
+    # ~70k tiny kernel launches per request, and it measured 3.7x *slower* on the
+    # B60 (262 ms/denoise step vs 70 ms; see spikes/lingbot_vla_v2/PHASE5_PERF.md).
+    # Kept because the arithmetic argument still holds behind a real grouped
+    # kernel or on a device where launches are cheap. Same value up to fp32
+    # summation order.
+    moe_implementation: str = "dense"
 
     # --- Prefix / attention -------------------------------------------------
     adanorm_time: bool = True

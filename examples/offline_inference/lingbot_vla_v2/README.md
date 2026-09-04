@@ -11,7 +11,7 @@ The repository includes the small deployment-only assets under `deployment/`:
 - RobotWin state, action, and camera mapping
 - RobotWin training data layout and normalization statistics
 
-## Work log: 2026-09-03
+## Work log: 2026-09-03, extended 2026-09-04
 
 ### Completed
 
@@ -21,12 +21,12 @@ The repository includes the small deployment-only assets under `deployment/`:
 | M2: observation processor | Added RobotWin camera/state/action mapping, image and language processing, normalization and action reconstruction. All six model inputs match upstream exactly; action conversion has maximum absolute error `1.129e-07`. |
 | M3: vLLM-Omni pipeline | Added `LingbotVlaV2Pipeline`, registry integration, `SupportActionOutput`, action result routing, prepared-model generation, repository-local deployment assets, and offline XPU inference. |
 | M4: OpenPI protocol | Added the MessagePack/NumPy WebSocket transport, metadata handshake, reset/session handling, AsyncOmni adapter, `/v1/realtime/robot/openpi`, and a RobotWin client. A real XPU WebSocket request returned finite `float32[50,14]` actions. |
+| M5: latency and hardening | Attributed the request stage by stage, found the routed `gather` MoE kernel to be 3.7x slower than upstream's dense einsum on the B60, and defaulted to `dense` — 2.43 s to 0.70 s, with fp32 parity becoming exact at all 45 stages. Tested the protocol's failure paths, which found a payload ceiling above what the transport carries and a dead NumPy wire-format compatibility path. |
 
-The M1-M3 implementation is committed as `1e157bb7` (`Add LingBot-VLA 2.0 XPU
-inference support`). The M4 server, client, tests, metadata, and this work log are
-currently working-tree changes. Files under `spikes/` are investigation records
-and generated numerical artifacts; do not include the `.npz` files or Python
-caches in a product commit.
+M1-M3 are committed as `1e157bb7` (`Add LingBot-VLA 2.0 XPU inference support`)
+and M4 as `ac22eab4` (`Add OpenPI WebSocket serving for LingBot VLA`). M5 is not
+committed yet. `spikes/` holds investigation records and generated numerical
+artifacts; the `.npz` files and Python caches stay out of product commits.
 
 ### Validation results
 
@@ -34,12 +34,21 @@ caches in a product commit.
   76 training-only align-head tensors dropped.
 - XPU model memory: 11.7341 GiB in bf16.
 - Offline output: `type=actions shape=(50, 14) dtype=float32`.
-- Offline post-warmup request: 2.426-2.473 seconds in the measured runs.
-- OpenPI server request: 2.744 seconds server-side.
-- Focused M1-M4 tests: `34 passed, 1 skipped`; the skip is the opt-in real
+- Offline example, one cold request with no warmup: 0.891 seconds.
+- OpenPI WebSocket, eight warm requests on one connection: 0.732-0.935 seconds,
+  1.07-1.37 Hz.
+- Model kernel alone, warm and in-process: 0.703 seconds, of which the 10-step
+  denoise loop is 0.607 seconds and the observation processor is 2 milliseconds.
+- These are after the M5 MoE default changed from `gather` to `dense`, which was
+  the whole of the speedup; the same paths measured 2.4-2.7 seconds before it.
+  `spikes/lingbot_vla_v2/PHASE5_PERF.md` has the plan and the per-step
+  conclusions, including which earlier numbers were measured on a loaded host.
+- Focused M1-M5 tests: `49 passed, 1 skipped`; the skip is the opt-in real
   checkpoint configuration test.
-- Ruff, Python compilation, editor diagnostics, and `git diff --check` pass for
-  the touched M4 files.
+- Live protocol probe (`spikes/lingbot_vla_v2/phase5_protocol_probe.py`): idle
+  close at 30.0 seconds, malformed payloads refused without ending the session,
+  a 48 MiB frame closed by the transport, and both NumPy wire formats served.
+- Ruff check and format pass for every touched product, example and test file.
 
 Focused regression command:
 
@@ -90,26 +99,58 @@ not block LingBot model loading or inference.
 
 ### Remaining work
 
-1. **M5 latency attribution.** Measure processor CPU time, host-to-XPU transfer,
-   model execution, postprocessing/device synchronization, worker IPC, and full
-   WebSocket time over several post-warmup requests.
-2. **MoE A/B benchmark.** Compare the current routed gather implementation with
-   the upstream grouped dense-einsum reference. The planned temporary dense
-   benchmark has not been run yet.
-3. **Performance target.** First reach the M4 acceptance threshold of less than
-   one second per action chunk, then match or beat the Phase 0 direct-kernel
-   baseline of 0.74 seconds. Current serving throughput is about 0.36 Hz.
-4. **Kernel optimization.** Only after attribution, evaluate fixed-shape
-   compilation and an XPU grouped MoE kernel while retaining the eager dense path
-   as the numerical reference.
-5. **Protocol hardening.** Add explicit tests for idle timeout, oversized/invalid
-   payloads, sanitized inference errors, and interoperability with the official
-   `openpi-client` package.
-6. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
+1. **Observation validation.** An observation that decodes but lacks a key the
+   processor needs is only caught in the worker, so the client pays a round trip
+   and is told `Internal inference error` rather than which key is missing.
+   Checking it in the WebSocket transport was tried and reverted: that layer
+   serves any robot policy and must not require cameras or a state vector.
+2. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
    a matching reference bundle is available; current parity is against the
    Transformers 5.8 environment.
-7. **Commit M4.** Stage the OpenPI modules, API integration, client, tests,
-   prepared metadata, and documentation without staging `spikes/` artifacts.
+3. **Optional kernel work.** A real grouped MoE kernel is worth about 8x of the
+   denoise loop's arithmetic at top-4 of 32, but only on a device where kernel
+   launches are cheap enough to collect it; the Python-loop version measured 3.7x
+   slower. Not needed for either performance target.
+4. **No accuracy benchmark.** Everything validated so far is a port check —
+   fp32 parity against golden tensors proves the weights and the graph were not
+   mistranslated, not that the policy acts correctly. There is no open-loop
+   evaluation: predicted action chunks are never compared against dataset ground
+   truth. `examples/offline_inference/internvla_a1/internvla_a1_common.py` in
+   upstream v0.28 has the shape to copy (`run_open_loop_evaluation`: per-episode
+   MSE/MAE, split joint vs. gripper, with plots). This is the largest gap in the
+   port's validation and it is a correctness gap, not a performance one.
+5. **The performance check emits no machine-readable artifact.**
+   `run_perf_check.sh` prints a verdict and exits non-zero, which gates a
+   regression but cannot be diffed across runs. Upstream's
+   `examples/offline_inference/internvla_a1/end2end.py` writes
+   `forward_latency.json` with mean/stdev/min/max/p50/p90 plus dtype, attention
+   implementation and compile flags. Matching that schema — and adding p90, which
+   the current median/min/max does not give — would make runs comparable and let
+   the numbers feed a perf config the way `tests/dfx/perf/tests/*.json` does
+   upstream. Note that no VLA model has such a config upstream either, so there
+   is no format to conform to yet, only one to borrow.
+6. **Divergence from upstream's VLA conventions.** Upstream v0.28 now ships
+   `pi0`, `gr00t`, `internvla_a1` and `dreamzero` against this same OpenPI
+   endpoint, and configures them through `vllm_omni/deploy/<model>.yaml`: one
+   diffusion stage, `max_num_seqs: 1`, and the handshake metadata in a
+   `policy_server_config` block. This port instead has `prepare_lingbot_vla_v2.py`
+   serialize the whole config into `transformer/config.json`, which is what makes
+   a stale prepared directory silently pin old settings. Worth evaluating whether
+   to move to the deploy-config convention before the two diverge further.
+
+Items 4-6 came from surveying upstream v0.28 (`v0.28.0-3-ga65e89cb`) for a
+standard VLA benchmark. There is none: `benchmarks/` has no VLA entry, none of
+the 27 perf configs under `tests/dfx/perf/tests/` covers a VLA model, the pi0 and
+gr00t e2e tests assert handshake metadata and shapes rather than latency, and
+`examples/online_serving/pi0/openpi_client.py` does not time its requests. So
+`run_perf_check.sh` is not duplicating something that already exists — but the
+two internvla_a1 harnesses above are the conventions to converge on.
+
+M5 is closed. Both performance targets are met — the M4 threshold of one second
+per action chunk and the Phase 0 direct-kernel baseline of 0.74 seconds — and the
+protocol's failure paths are tested, which found two defects: a payload ceiling
+set above what the transport carries, and a dead NumPy wire-format compatibility
+path. `spikes/lingbot_vla_v2/PHASE5_PERF.md` holds the plan and every conclusion.
 
 ## Deployment asset provenance
 
@@ -148,6 +189,32 @@ The 6B policy weights are not copied into this repository. Download them from
 [`robbyant/lingbot-vla-v2-6b`](https://huggingface.co/robbyant/lingbot-vla-v2-6b)
 at the revision tested here, `11c703bf6a5c1f45b3b69168482da11fdbba53d7`.
 The preparation command below creates symlinks to its six safetensors shards.
+
+## One-command performance check
+
+```bash
+docker exec test-image_zy_b8.3.2_lingbot_omni sh -lc '
+cd /llm/zhuyong/lingbovla/my/vllm-omni &&
+examples/online_serving/lingbot_vla_v2/run_perf_check.sh'
+```
+
+It regenerates the prepared directory, starts the server, sends warm requests
+over one WebSocket connection, discards the first, and checks the median against
+the 1 Hz acceptance criterion. It exits non-zero if the target is missed, so it
+works as a regression gate. `--attribution` adds the per-stage breakdown,
+`--no-offline` skips the cold-start request, `--requests N` changes the sample
+count.
+
+Two behaviours worth knowing, both learned the hard way:
+
+- It **refuses to measure on a busy host** (exit code 3), listing any orphaned
+  Python processes it found. Leaked workers from an earlier run hold host RAM and
+  the whole XPU allocation, and once inflated a 1.9 ms stage to 178 ms — which
+  sent a whole optimization step after a cost that did not exist.
+- It regenerates the prepared directory every time, because
+  `prepare_lingbot_vla_v2.py` serializes the entire config into
+  `transformer/config.json`. A directory built before a config change silently
+  keeps serving the old settings.
 
 ## One-command XPU test
 
@@ -257,8 +324,9 @@ examples/online_serving/lingbot_vla_v2/run_openpi_client.sh'
 The endpoint is `ws://127.0.0.1:8000/v1/realtime/robot/openpi`. It sends the
 policy metadata immediately after connection and returns one float32
 `[50, 14]` action chunk for each observation. The measured v0.14.0 XPU WebSocket
-round trip was 2.74 seconds; the transport is functional, but reaching 1 Hz is
-still an M5 performance task.
+round trip is 0.73-0.94 seconds, or 1.07-1.37 Hz, over eight consecutive requests
+on one connection. The engine, its worker IPC and the transport together account
+for about 110 milliseconds of that at the median.
 
 ### `Robot policy not available` response
 
@@ -274,18 +342,3 @@ Older client code then reports `TypeError: a bytes-like object is required, not
 'str'`. Regenerate the prepared directory with the current preparation script and
 restart the server. `run_openpi_server.sh` performs both steps automatically
 inside the container.
-
-## Stage M4 files
-
-Stage these M4 files, but do not stage `spikes/` or its `.npz` artifacts:
-
-```bash
-git add \
-  examples/offline_inference/lingbot_vla_v2/README.md \
-  examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
-  examples/online_serving/lingbot_vla_v2/ \
-  tests/entrypoints/openai_api/test_openpi_connection.py \
-  tests/entrypoints/openai_api/test_openpi_serving.py \
-  vllm_omni/entrypoints/openai/api_server.py \
-  vllm_omni/entrypoints/openpi/
-```

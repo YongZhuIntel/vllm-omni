@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from vllm_omni.diffusion.models.lingbot_vla_v2 import LingbotVlaV2Config
+from vllm_omni.diffusion.models.lingbot_vla_v2.processor import RobotSpec
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEPLOYMENT_DIR = EXAMPLE_DIR / "deployment"
@@ -30,20 +31,31 @@ def prepare(args: argparse.Namespace) -> Path:
         checkpoint.as_posix(),
         qwen3vl_path=Path(args.qwen3vl_path).resolve().as_posix(),
     )
+    robot_config = Path(args.robot_config).resolve()
+    data_config = Path(args.data_config).resolve()
+    norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
+    # The OpenPI handshake tells a robot what to send, so it has to be derived
+    # from the deployment spec rather than from the model config: the frame size
+    # comes from the training config's img_size (256 for RobotWin), not from
+    # `config.image_resolution`, and the action width is the robot's own vector,
+    # not the policy's padded 55.
+    spec = RobotSpec.from_files(robot_config, data_config, norm_stats)
+    action_dim = max(sl.end for slices in spec.action_slices.values() for sl in slices)
+
     payload = asdict(config)
     payload.update(
-        robot_config=Path(args.robot_config).resolve().as_posix(),
-        data_config=Path(args.data_config).resolve().as_posix(),
-        norm_stats=Path(args.norm_stats).resolve().as_posix() if args.norm_stats else None,
+        robot_config=robot_config.as_posix(),
+        data_config=data_config.as_posix(),
+        norm_stats=norm_stats.as_posix() if norm_stats else None,
         policy_server_config={
-            "image_resolution": list(config.image_resolution),
+            "image_resolution": [spec.image_size, spec.image_size],
             "n_external_cameras": 1,
             "needs_wrist_camera": True,
             "needs_stereo_camera": False,
             "needs_session_id": False,
             "action_space": "joint_position",
             "action_horizon": config.chunk_size,
-            "action_dim": 14,
+            "action_dim": action_dim,
             "max_cameras": config.max_cameras,
         },
     )

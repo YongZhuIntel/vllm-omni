@@ -43,10 +43,12 @@ Deliberate divergences from the upstream reference, each verified numerically:
   ``x_t = noise`` then ``x_t += dt * v_t``, denoising the caller's tensor in
   place; a pipeline that reuses a noise buffer silently starts request *n* from
   request *n-1*'s chunk.
-* The MoE runs a **gather** kernel (each expert sees only its routed tokens)
-  instead of upstream's dense path (every expert sees every token, zero-weighted
-  afterwards). Same value up to fp32 summation order, 8× fewer FLOPs at top-4 of
-  32. ``moe_implementation="dense"`` restores the reference path for debugging.
+* The MoE keeps upstream's dense path by default but also offers a **gather**
+  kernel (``moe_implementation="gather"``) in which each expert sees only its
+  routed tokens — 8× fewer FLOPs at top-4 of 32, and 3.7× slower on the B60,
+  because 32 experts × 36 layers × 10 steps is ~70k tiny kernel launches. Same
+  value up to fp32 summation order either way. See
+  ``spikes/lingbot_vla_v2/PHASE5_PERF.md``.
 * The align *heads* (Perceiver resamplers + MoGe depth head, 120.68 M params,
   76 tensors) are not built. They only produce training-time alignment targets.
   The learned query *tables* they were trained with are still built and used —
@@ -524,18 +526,20 @@ class GroupedExperts(nn.Module):
         up_proj   [E, intermediate, hidden]
         down_proj [E, hidden, intermediate]
 
-    Two kernels over the same parameters:
+    Two kernels over the same parameters, agreeing up to fp32 summation order:
 
-    ``gather`` (default)
-        Each expert runs on exactly the tokens routed to it. At top-4 of 32 this
-        is 8× less arithmetic than ``dense``.
-
-    ``dense``
+    ``dense`` (default)
         Every expert runs on every token; the routing weights (zero for
-        unselected pairs) then contract the expert axis away. This is upstream's
-        eager path and therefore what the fp32 golden was produced with, so it
-        stays available for exact parity work. The two agree up to fp32
-        summation order.
+        unselected pairs) then contract the expert axis away. Three einsums per
+        layer. This is upstream's eager path and what the fp32 golden was
+        produced with, and it is also the faster of the two here.
+
+    ``gather``
+        Each expert runs on exactly the tokens routed to it — 8× less arithmetic
+        than ``dense`` at top-4 of 32, but as a Python loop over 32 experts it
+        pays ~70k kernel launches per request and measured 3.7× slower on the
+        B60. Kept because the arithmetic argument becomes real behind a grouped
+        kernel, or on a device where launches are cheap.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int) -> None:

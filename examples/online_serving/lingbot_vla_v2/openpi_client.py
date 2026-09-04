@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import uuid
 
 import numpy as np
@@ -35,12 +36,6 @@ def main() -> int:
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    observation = {
-        "images": {key: rng.integers(0, 256, (224, 224, 3), dtype=np.uint8) for key in CAMERA_KEYS},
-        "state": np.zeros(14, dtype=np.float32),
-        "prompt": args.prompt,
-        "session_id": str(uuid.uuid4()),
-    }
     uri = f"ws://{args.host}:{args.port}/v1/realtime/robot/openpi"
     with connect(uri, max_size=MAX_OPENPI_PAYLOAD_BYTES) as websocket:
         handshake = websocket.recv()
@@ -52,15 +47,31 @@ def main() -> int:
             raise RuntimeError(f"OpenPI endpoint did not return MessagePack metadata: {error}")
         metadata = _unpack(handshake)
         print(f"metadata={metadata}")
+
+        # The handshake is the contract: send frames at the size and state at the
+        # width the server asked for. Hardcoding them here would hide a server
+        # that advertises one thing and resizes to another.
+        height, width = metadata["image_resolution"]
+        observation = {
+            "images": {key: rng.integers(0, 256, (height, width, 3), dtype=np.uint8) for key in CAMERA_KEYS},
+            "state": np.zeros(metadata["action_dim"], dtype=np.float32),
+            "prompt": args.prompt,
+            "session_id": str(uuid.uuid4()),
+        }
         for step in range(args.num_steps):
+            start = time.perf_counter()
             websocket.send(_pack(observation))
             response = _unpack(websocket.recv())
+            elapsed = time.perf_counter() - start
             if isinstance(response, dict) and response.get("type") == "error":
                 raise RuntimeError(response.get("message", "OpenPI inference failed"))
             actions = np.asarray(response, dtype=np.float32)
             if not np.isfinite(actions).all():
                 raise RuntimeError("server returned non-finite actions")
-            print(f"step={step} shape={actions.shape} mean={actions.mean():.6f} std={actions.std():.6f}")
+            print(
+                f"step={step} shape={actions.shape} mean={actions.mean():.6f} "
+                f"std={actions.std():.6f} elapsed={elapsed:.3f}s ({1 / elapsed:.2f} Hz)"
+            )
     return 0
 
 

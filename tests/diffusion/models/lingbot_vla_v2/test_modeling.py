@@ -210,18 +210,27 @@ def test_sample_actions_does_not_alias_the_caller_noise(model, observation):
 
 
 def test_moe_kernels_agree(model, observation):
-    """``gather`` (default, 8x less arithmetic at top-4 of 32) and ``dense``
-    (upstream's eager kernel) are the same function of the same parameters."""
-    gather = _sample(model, observation, noise=observation["noise"].clone())
+    """``dense`` (the default, upstream's eager kernel) and ``gather`` (8x less
+    arithmetic at top-4 of 32) are the same function of the same parameters.
+
+    Written without assuming which one is the default: that has already flipped
+    once, when ``gather`` turned out to be 3.7x slower on XPU.
+    """
     blocks = [m for m in model.modules() if hasattr(m, "moe_implementation")]
     assert blocks, "the tiny model must instantiate at least one token-MoE block"
+    original = [block.moe_implementation for block in blocks]
+
+    def sample_with(implementation):
+        for block in blocks:
+            block.moe_implementation = implementation
+        return _sample(model, observation, noise=observation["noise"].clone())
+
     try:
-        for block in blocks:
-            block.moe_implementation = "dense"
-        dense = _sample(model, observation, noise=observation["noise"].clone())
+        dense = sample_with("dense")
+        gather = sample_with("gather")
     finally:
-        for block in blocks:
-            block.moe_implementation = "gather"
+        for block, implementation in zip(blocks, original, strict=True):
+            block.moe_implementation = implementation
     assert torch.allclose(gather, dense, atol=1e-6, rtol=0)
 
 

@@ -17,8 +17,19 @@ from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
-MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
+# Matched to uvicorn's own ``ws_max_size`` default, which neither vLLM nor
+# vLLM-Omni overrides. A larger value here would not buy any capacity: the
+# transport drops a frame above 16 MiB before this module sees it, and the robot
+# gets a 1009 close instead of the error frame below. Three 256x256 RGB frames
+# and a 14-wide state are ~600 KiB, so this is ~25x the working payload.
+MAX_OPENPI_PAYLOAD_BYTES = 16 * 1024 * 1024
 _MISSING = object()
+# Known limitation: an observation that decodes but is missing a key the *model's*
+# processor needs is only caught in the worker, so the client pays an IPC round
+# trip and is told "Internal inference error" rather than which key. Validating
+# it here was tried and reverted — this transport serves any robot policy, and
+# requiring images or a state vector at this layer would reject a policy that
+# takes neither. The fix belongs wherever the policy's own input contract lives.
 
 
 def _pack_numpy(obj: Any) -> Any:
@@ -57,9 +68,17 @@ def _decode_vllm_numpy_marker(obj: dict[Any, Any]) -> Any:
     data = _mapping_get(obj, "data", _MISSING)
     if nd is _MISSING or dtype is _MISSING or kind is _MISSING or data is _MISSING:
         return _MISSING
+    # ``kind`` is not a copy of ``dtype.kind``. In this wire format (msgpack-numpy's)
+    # it is "" for every ordinary dtype and "V" for a structured one, in which case
+    # ``type`` carries a descr list instead of a dtype string. Comparing it to
+    # ``dtype.kind`` rejected every float and integer array this path exists to
+    # accept, which made the whole path dead.
+    kind_text = _decode_marker_text(kind)
+    if kind_text == "V":
+        raise ValueError("Unsupported dtype: structured arrays are not accepted")
+    if kind_text != "":
+        raise ValueError(f"Unrecognized NumPy dtype marker kind: {kind_text!r}")
     dtype_obj = np.dtype(_decode_marker_text(dtype))
-    if dtype_obj.kind != _decode_marker_text(kind):
-        raise ValueError("NumPy dtype marker kind mismatch")
     if dtype_obj.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {dtype_obj}")
     array = np.frombuffer(data, dtype=dtype_obj).copy()
