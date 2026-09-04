@@ -128,15 +128,245 @@ not block LingBot model loading or inference.
   reference path also computes all 32 experts densely. Grouped routing remains
   a possible algorithmic improvement, but it is not required to match the
   289 ms reference and is no longer the next optimization.
-4. **No accuracy benchmark.** Everything validated so far is a port check —
-   fp32 parity against golden tensors proves the weights and the graph were not
-   mistranslated, not that the policy acts correctly. There is no open-loop
-   evaluation: predicted action chunks are never compared against dataset ground
-   truth. `examples/offline_inference/internvla_a1/internvla_a1_common.py` in
-   upstream v0.28 has the shape to copy (`run_open_loop_evaluation`: per-episode
-   MSE/MAE, split joint vs. gripper, with plots). This is the largest gap in the
-   port's validation and it is a correctness gap, not a performance one.
-5. **The performance check emits no machine-readable artifact.**
+
+## Open-loop action accuracy
+
+Open-loop evaluation is split into two environments. The upstream LingBot /
+LeRobot environment decodes the held-out dataset and exports a portable NPZ
+bundle; the vLLM-Omni container consumes that bundle without installing LeRobot
+or a video decoder.
+
+### 1. Download and convert RobotWin data
+
+Run the data preparation in `test-image_zy_b8.3.2_lingbot`. Clone RoboTwin with
+its pinned XPolicyLab submodule:
+
+```bash
+cd /llm/zhuyong/lingbovla
+git clone --recurse-submodules \
+  https://github.com/RoboTwin-Platform/RoboTwin.git
+```
+
+Activate the upstream LingBot environment and install its pinned LeRobot. The
+environment already contains `torchcodec==0.6.0` and `av==15.0.0`.
+
+```bash
+source /llm/zhuyong/lingbovla/frameworks.robotics.embodied-intelligence.lingbot-vla-v2/.venv-intel-dev/bin/activate
+python -m pip install --no-deps \
+  "lerobot @ https://github.com/huggingface/lerobot/archive/refs/tags/v0.4.2.tar.gz"
+```
+
+Download one official task through the Hugging Face mirror. This fetches only
+`dataset/adjust_bottle/demo_clean.zip` (about 292 MB), not the complete 1.53 TB
+RoboTwin release.
+
+```bash
+cd /llm/zhuyong/lingbovla/RoboTwin
+export HF_ENDPOINT=https://hf-mirror.com
+HF_MAX_WORKERS=1 HF_EXTRACT_WORKERS=1 \
+  bash scripts/download_xpolicylab_data.sh adjust_bottle
+```
+
+The extracted task contains 50 HDF5 trajectories, 50 videos and 50 instruction
+files under:
+
+```text
+/llm/zhuyong/lingbovla/RoboTwin/data/demo_clean/adjust_bottle/aloha_agilex
+```
+
+Convert all 50 episodes to the LeRobot v2.1 layout used by LingBot:
+
+```bash
+export HF_LEROBOT_HOME=/llm/zhuyong/lingbovla/datasets/lerobot
+python XPolicyLab/scripts/transform_lerobot_v21_format.py \
+  "demo_clean.adjust_bottle.aloha_agilex" \
+  --repo_id adjust_bottle_demo_clean \
+  --max_episode 50
+```
+
+The tested XPolicyLab v3 converter passes `streaming_encoding` to
+`LeRobotDataset.create()`, which is not supported by the upstream-pinned
+`lerobot==0.4.2`. Use `transform_lerobot_v21_format.py`, not the v3 converter,
+unless the LeRobot environment is upgraded together with the converter.
+
+The converted dataset is written to:
+
+```text
+/llm/zhuyong/lingbovla/datasets/lerobot/adjust_bottle_demo_clean
+```
+
+### 2. Export held-out RobotWin episodes
+
+Still in the upstream LingBot environment, export portable chunks. This example
+selects episodes 0-2 and two chunks per episode for a quick smoke test:
+
+```bash
+cd /llm/zhuyong/lingbovla/my/vllm-omni
+python examples/offline_inference/lingbot_vla_v2/export_open_loop_bundle.py \
+  --lingbot-root /llm/zhuyong/lingbovla/frameworks.robotics.embodied-intelligence.lingbot-vla-v2/lingbot-vla-v2 \
+  --data-path /llm/zhuyong/lingbovla/datasets/lerobot/adjust_bottle_demo_clean \
+  --episodes 0 1 2 \
+  --max-chunks-per-episode 2 \
+  --output /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz
+```
+
+The exporter reuses upstream `LeRobotDataset`, `FeatureTransform.apply()`, and
+`FeatureTransform.unapply()`. Ground truth is therefore stored in raw RobotWin
+units with the same feature order as upstream evaluation. Episode-tail padding
+is recorded in `valid_steps` and excluded from metrics.
+
+Bundle schema:
+
+| Key | Shape/type |
+| --- | --- |
+| `images` | `uint8[N,3,H,W,3]`, high/left-wrist/right-wrist |
+| `states` | `float32[N,14]` |
+| `actions` | `float32[N,50,14]`, raw robot units |
+| `prompts` | string `[N]` |
+| `episode_ids`, `frame_indices` | integer `[N]` |
+| `valid_steps` | integer `[N]`, valid rows in each action chunk |
+
+### 3. Choose the checkpoint for the evaluation goal
+
+Use the same checkpoint on both sides of a comparison. The two released
+checkpoints answer different questions:
+
+- `lingbot-vla-v2-6b`: use this to validate that the vLLM-Omni port preserves
+  the behavior of the base model used throughout M1-M5. It is also sufficient
+  for comparing eager and compiled execution because only the runtime changes.
+- `lingbot-vla-v2-6b-robotwin`: use this only when measuring the task accuracy
+  of the official RobotWin post-trained policy or comparing against its published
+  RoboTwin results.
+
+The open-loop harness accepts either checkpoint. Scores from the two checkpoints
+must not be compared as if they measured an implementation regression: their
+weights are different.
+
+The base checkpoint already used by this port is:
+
+```text
+/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b
+```
+
+To optionally download the official RobotWin post-trained checkpoint, run this
+inside `test-image_zy_b8.3.2_lingbot`:
+
+```bash
+cd /llm/zhuyong/lingbovla/my/vllm-omni
+examples/offline_inference/lingbot_vla_v2/download_robotwin_checkpoint.sh
+```
+
+The script defaults to `HF_ENDPOINT=https://hf-mirror.com`, pins revision
+`0451855729ec904f970600e0aec8b84661423afe`, and downloads only the final
+inference checkpoint subtree. The complete download is about 25.5 GB. It is
+resumable: rerun the same command to continue existing `.incomplete` files.
+
+The checkpoint passed to the preparation script is:
+
+```text
+/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b-robotwin/checkpoints/global_step_50000/hf_ckpt
+```
+
+Prepare eager and compiled directories from those weights:
+
+```bash
+python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
+  --checkpoint /llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b-robotwin/checkpoints/global_step_50000/hf_ckpt \
+  --output /tmp/lingbot-robotwin-eager
+
+python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
+  --checkpoint /llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b-robotwin/checkpoints/global_step_50000/hf_ckpt \
+  --output /tmp/lingbot-robotwin-compiled \
+  --compile-denoise-step
+```
+
+### 4. Evaluate through vLLM-Omni
+
+The simplest command, run inside `test-image_zy_b8.3.2_lingbot_omni`, evaluates
+the existing six-chunk bundle with the base checkpoint:
+
+```bash
+cd /llm/zhuyong/lingbovla/my/vllm-omni
+examples/offline_inference/lingbot_vla_v2/run_open_loop_eval.sh
+```
+
+Run eager and compiled modes on identical samples/noise and generate a comparison:
+
+```bash
+examples/offline_inference/lingbot_vla_v2/run_open_loop_eval.sh --mode both
+```
+
+Use `--checkpoint` to select the optional RobotWin post-trained checkpoint,
+`--dataset` for another exported bundle, and `--episodes` / `--max-samples` to
+select evaluation samples. The script always validates the bundle first and
+rebuilds each prepared model directory to avoid stale configuration.
+
+Validate the bundle without loading the model:
+
+```bash
+python examples/offline_inference/lingbot_vla_v2/open_loop_eval.py \
+  --dataset /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz \
+  --output-dir /tmp/robotwin-open-loop-dry-run \
+  --dry-run
+```
+
+Run model inference in the XPU container:
+
+```bash
+python examples/offline_inference/lingbot_vla_v2/open_loop_eval.py \
+  --model /tmp/lingbot-robotwin-eager \
+  --dataset /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz \
+  --output-dir /tmp/robotwin-open-loop-eager \
+  --dtype bfloat16 --seed 1234 --plots
+```
+
+The evaluator writes `metrics.json` and `predictions.npz`. Metrics include
+micro/macro and per-episode MSE/MAE for all 14 dimensions, the 12 arm joints,
+and the two grippers. With `--plots`, it also writes one 14-axis GT/prediction PNG
+per episode. Noise is deterministic per bundle sample and its seed/hash is stored
+with predictions.
+
+Run the same bundle and seed with `/tmp/lingbot-robotwin-compiled`, writing to a
+separate output directory, then compare both result sets. Do not judge the
+compiled path from synthetic parity alone; its measured action-chunk drift
+versus eager is 1.75% in bf16.
+
+```bash
+python examples/offline_inference/lingbot_vla_v2/open_loop_eval.py \
+  --model /tmp/lingbot-robotwin-compiled \
+  --dataset /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz \
+  --output-dir /tmp/robotwin-open-loop-compiled \
+  --dtype bfloat16 --seed 1234 --plots
+```
+
+```bash
+python examples/offline_inference/lingbot_vla_v2/compare_open_loop.py \
+  --baseline /tmp/robotwin-open-loop-eager \
+  --candidate /tmp/robotwin-open-loop-compiled \
+  --output /tmp/robotwin-open-loop-comparison.json
+```
+
+The workflow was smoke-tested with the official `adjust_bottle/demo_clean`
+archive downloaded through `HF_ENDPOINT=https://hf-mirror.com`. Fifty episodes
+were converted with XPolicyLab's LeRobot v2.1 converter to:
+
+```text
+/llm/zhuyong/lingbovla/datasets/lerobot/adjust_bottle_demo_clean
+```
+
+A six-chunk bundle (episodes 0-2, frames 0 and 50) was exported to:
+
+```text
+/llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz
+```
+
+This small run validates the harness, not the published RoboTwin benchmark. A
+representative score requires the RobotWin post-trained checkpoint and a larger,
+predeclared held-out split.
+
+### Known remaining evaluation work
+
+1. **The performance check emits no machine-readable artifact.**
    `run_perf_check.sh` prints a verdict and exits non-zero, which gates a
    regression but cannot be diffed across runs. Upstream's
    `examples/offline_inference/internvla_a1/end2end.py` writes
@@ -146,7 +376,7 @@ not block LingBot model loading or inference.
    the numbers feed a perf config the way `tests/dfx/perf/tests/*.json` does
    upstream. Note that no VLA model has such a config upstream either, so there
    is no format to conform to yet, only one to borrow.
-6. **Divergence from upstream's VLA conventions.** Upstream v0.28 now ships
+2. **Divergence from upstream's VLA conventions.** Upstream v0.28 now ships
    `pi0`, `gr00t`, `internvla_a1` and `dreamzero` against this same OpenPI
    endpoint, and configures them through `vllm_omni/deploy/<model>.yaml`: one
    diffusion stage, `max_num_seqs: 1`, and the handshake metadata in a
@@ -155,7 +385,7 @@ not block LingBot model loading or inference.
    a stale prepared directory silently pin old settings. Worth evaluating whether
    to move to the deploy-config convention before the two diverge further.
 
-Items 4-6 came from surveying upstream v0.28 (`v0.28.0-3-ga65e89cb`) for a
+These items came from surveying upstream v0.28 (`v0.28.0-3-ga65e89cb`) for a
 standard VLA benchmark. There is none: `benchmarks/` has no VLA entry, none of
 the 27 perf configs under `tests/dfx/perf/tests/` covers a VLA model, the pi0 and
 gr00t e2e tests assert handshake metadata and shapes rather than latency, and
