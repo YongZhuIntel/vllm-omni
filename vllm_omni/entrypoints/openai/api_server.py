@@ -19,7 +19,7 @@ from typing import Annotated, Any, cast
 
 import httpx
 import vllm.envs as envs
-from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
@@ -88,6 +88,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -380,6 +381,10 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
         )
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -662,6 +667,7 @@ async def omni_init_app_state(
     state.openai_serving_speech = OmniOpenAIServingSpeech(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
+    state.openai_serving_realtime_robot = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -673,6 +679,22 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
+
+
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """OpenPI-compatible WebSocket endpoint for robot policy inference."""
+    from vllm_omni.entrypoints.openpi.connection import RobotRealtimeConnection
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {"type": "error", "error": "Robot policy not available", "code": "unsupported"}
+        )
+        await websocket.close()
+        return
+    await RobotRealtimeConnection(websocket, serving).handle_connection()
 
 
 @router.post(

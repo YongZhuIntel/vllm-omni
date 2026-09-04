@@ -35,6 +35,17 @@ def prepare(args: argparse.Namespace) -> Path:
         robot_config=Path(args.robot_config).resolve().as_posix(),
         data_config=Path(args.data_config).resolve().as_posix(),
         norm_stats=Path(args.norm_stats).resolve().as_posix() if args.norm_stats else None,
+        policy_server_config={
+            "image_resolution": list(config.image_resolution),
+            "n_external_cameras": 1,
+            "needs_wrist_camera": True,
+            "needs_stereo_camera": False,
+            "needs_session_id": False,
+            "action_space": "joint_position",
+            "action_horizon": config.chunk_size,
+            "action_dim": 14,
+            "max_cameras": config.max_cameras,
+        },
     )
     (output / "model_index.json").write_text(json.dumps({"_class_name": "LingbotVlaV2Pipeline"}, indent=2) + "\n")
     (transformer_dir / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
