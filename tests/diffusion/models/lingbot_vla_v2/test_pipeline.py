@@ -51,11 +51,14 @@ class FakePolicy:
         self.sample_kwargs = kwargs
         return torch.ones(1, 3, 4)
 
+    def predict_velocity(self, **kwargs):
+        return kwargs
+
     def load_weights(self, weights):
         return {name for name, _ in weights}
 
 
-def _pipeline(tmp_path) -> LingbotVlaV2Pipeline:
+def _pipeline(tmp_path, *, compile_denoise_step=False) -> LingbotVlaV2Pipeline:
     config = OmniDiffusionConfig(
         model=str(tmp_path),
         model_class_name="LingbotVlaV2Pipeline",
@@ -69,6 +72,7 @@ def _pipeline(tmp_path) -> LingbotVlaV2Pipeline:
                 "max_action_dim": 4,
                 "max_state_dim": 4,
                 "num_steps": 10,
+                "compile_denoise_step": compile_denoise_step,
             }
         ),
     )
@@ -143,3 +147,20 @@ def test_load_weights_delegates_to_policy(tmp_path):
     pipeline = _pipeline(tmp_path)
     loaded = pipeline.load_weights([("weight", torch.ones(1))])
     assert loaded == {"weight"}
+
+
+def test_pipeline_compiles_denoise_step_only_when_enabled(tmp_path):
+    compiled = Mock()
+    with patch("torch.compile", return_value=compiled) as compile_mock:
+        pipeline = _pipeline(tmp_path, compile_denoise_step=True)
+
+    compile_mock.assert_called_once()
+    original = compile_mock.call_args.args[0]
+    assert original.__self__ is pipeline.transformer
+    assert original.__name__ == "predict_velocity"
+    assert compile_mock.call_args.kwargs == {
+        "backend": "inductor",
+        "dynamic": False,
+        "fullgraph": True,
+    }
+    assert pipeline.transformer.predict_velocity is compiled

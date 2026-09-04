@@ -156,6 +156,10 @@ class LingbotVlaV2Config:
     # portable pure-torch paths are the default here.
     attention_implementation: str = "eager"
     vit_attn_implementation: str = "sdpa"
+    # Opt-in: Inductor reduces the fixed-shape 10-step denoise loop from ~607 ms
+    # to ~215 ms on B60, but changes a bf16 action chunk by ~1.75% relative to
+    # eager. Keep disabled until the deployment accepts that numerical envelope.
+    compile_denoise_step: bool = False
 
     def __post_init__(self) -> None:
         resolution = self.image_resolution

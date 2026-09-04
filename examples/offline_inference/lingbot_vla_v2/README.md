@@ -99,18 +99,35 @@ not block LingBot model loading or inference.
 
 ### Remaining work
 
-1. **Observation validation.** An observation that decodes but lacks a key the
-   processor needs is only caught in the worker, so the client pays a round trip
-   and is told `Internal inference error` rather than which key is missing.
-   Checking it in the WebSocket transport was tried and reverted: that layer
-   serves any robot policy and must not require cameras or a state vector.
-2. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
-   a matching reference bundle is available; current parity is against the
-   Transformers 5.8 environment.
-3. **Optional kernel work.** A real grouped MoE kernel is worth about 8x of the
-   denoise loop's arithmetic at top-4 of 32, but only on a device where kernel
-   launches are cheap enough to collect it; the Python-loop version measured 3.7x
-   slower. Not needed for either performance target.
+1. **Validate compiled-denoise accuracy.** `--compile-denoise-step` reduces the
+  warm WebSocket median from about 0.70 s to 0.381 s (2.62 Hz), but the Inductor
+  graph changes a 10-step bf16 chunk by 1.75% relative to eager. It remains
+  opt-in until open-loop evaluation shows that this numerical envelope is safe.
+  `aot_eager` is bit-exact but gives no speedup; Inductor
+  `force_same_precision` and `emulate_precision_casts` did not remove the drift.
+2. **Open-loop accuracy benchmark.** Compare predicted action chunks with dataset
+  ground truth using per-episode MSE/MAE, split joint vs. gripper. This is the
+  largest correctness gap for both eager and compiled modes.
+3. **Machine-readable performance results.** Extend `run_perf_check.sh` to write
+  mean/stdev/min/max/p50/p90 plus dtype, MoE mode, compile mode and attention
+  backend to JSON.
+4. **Further compiler work.** The compiled model path is about 311 ms versus the
+  OpenVINO model-only reference of 289 ms, so the main efficiency gap is nearly
+  closed. Localize the remaining Inductor numerical drift before enabling the
+  optimization by default.
+5. **Observation validation.** An observation that decodes but lacks a key the
+  processor needs is only caught in the worker, so the client pays a round trip
+  and receives `Internal inference error` rather than the missing key.
+6. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
+  a matching reference bundle is available; current parity is against the
+  Transformers 5.8 environment.
+7. **Deployment convention.** Evaluate moving handshake/runtime settings from a
+  generated `transformer/config.json` to the newer
+  `vllm_omni/deploy/<model>.yaml` convention to avoid stale prepared configs.
+8. **Grouped/top-4 MoE is deferred.** Parsing the OpenVINO IR proved that its
+  reference path also computes all 32 experts densely. Grouped routing remains
+  a possible algorithmic improvement, but it is not required to match the
+  289 ms reference and is no longer the next optimization.
 4. **No accuracy benchmark.** Everything validated so far is a port check —
    fp32 parity against golden tensors proves the weights and the graph were not
    mistranslated, not that the policy acts correctly. There is no open-loop
@@ -203,7 +220,12 @@ over one WebSocket connection, discards the first, and checks the median against
 the 1 Hz acceptance criterion. It exits non-zero if the target is missed, so it
 works as a regression gate. `--attribution` adds the per-stage breakdown,
 `--no-offline` skips the cold-start request, `--requests N` changes the sample
-count.
+count, and `--compile-denoise-step` enables the experimental Inductor path. The
+compiled path is default-off because its measured bf16 chunk drift is 1.75%.
+
+The latest repeat measured a 0.411 s warm WebSocket median (2.43 Hz), a 215.6 ms
+denoise loop, and a 311.9 ms synchronized model path. This is close to the
+OpenVINO model-only reference of 289 ms.
 
 Two behaviours worth knowing, both learned the hard way:
 
@@ -302,6 +324,14 @@ stale metadata:
 docker exec -it test-image_zy_b8.3.2_lingbot_omni sh -lc '
 cd /llm/zhuyong/lingbovla/my/vllm-omni &&
 examples/online_serving/lingbot_vla_v2/run_openpi_server.sh'
+```
+
+Enable the compiled denoise step explicitly when the deployment accepts the
+measured 1.75% bf16 chunk drift:
+
+```bash
+examples/online_serving/lingbot_vla_v2/run_openpi_server.sh \
+  --compile-denoise-step
 ```
 
 In another terminal, run the synthetic RobotWin client:

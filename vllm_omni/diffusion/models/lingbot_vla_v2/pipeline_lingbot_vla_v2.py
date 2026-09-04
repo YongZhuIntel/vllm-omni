@@ -56,6 +56,13 @@ class LingbotVlaV2Pipeline(nn.Module, SupportActionOutput):
             image_processor=image_processor,
         )
         self.transformer = LingbotVlaV2ForActionPrediction(self.config)
+        if self.config.compile_denoise_step:
+            self.transformer.predict_velocity = torch.compile(
+                self.transformer.predict_velocity,
+                backend="inductor",
+                dynamic=False,
+                fullgraph=True,
+            )
         self.vae = None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(

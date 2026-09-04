@@ -31,6 +31,7 @@ def prepare(args: argparse.Namespace) -> Path:
         checkpoint.as_posix(),
         qwen3vl_path=Path(args.qwen3vl_path).resolve().as_posix(),
     )
+    config.compile_denoise_step = args.compile_denoise_step
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
     norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
@@ -84,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-config", default=DEFAULT_ROBOT_CONFIG)
     parser.add_argument("--data-config", default=DEFAULT_DATA_CONFIG)
     parser.add_argument("--norm-stats", default=DEFAULT_NORM_STATS)
+    parser.add_argument(
+        "--compile-denoise-step",
+        action="store_true",
+        help="compile predict_velocity with Inductor (faster, ~1.75% bf16 chunk drift measured on B60)",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 

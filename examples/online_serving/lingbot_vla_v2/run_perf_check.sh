@@ -25,6 +25,7 @@ BASELINE_S="0.74"        # Phase 0 bare-kernel reference, for context
 FORCE="0"
 RUN_OFFLINE="1"
 RUN_ATTRIBUTION="0"
+COMPILE_DENOISE_STEP="0"
 
 usage() {
     cat <<EOF
@@ -40,6 +41,8 @@ Options:
   --requests N        Measured warm requests, after one discarded (default: $REQUESTS)
   --no-offline        Skip the cold-start offline request
   --attribution       Also print the per-stage breakdown (adds a model load)
+    --compile-denoise-step
+                                             Compile predict_velocity with Inductor (experimental)
   --force             Measure even if the host looks busy
   -h, --help          Show this help
 EOF
@@ -54,6 +57,7 @@ while (($#)); do
         --requests) REQUESTS="$2"; shift 2 ;;
         --no-offline) RUN_OFFLINE="0"; shift ;;
         --attribution) RUN_ATTRIBUTION="1"; shift ;;
+        --compile-denoise-step) COMPILE_DENOISE_STEP="1"; shift ;;
         --force) FORCE="1"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -122,14 +126,20 @@ fi
 echo
 echo "== prepare =="
 rm -rf "$OUTPUT"
+PREPARE_ARGS=(--checkpoint "$CHECKPOINT" --output "$OUTPUT")
+if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
+    PREPARE_ARGS+=(--compile-denoise-step)
+fi
 python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
-    --checkpoint "$CHECKPOINT" --output "$OUTPUT" >"$LOG_DIR/prepare.log" 2>&1 \
+    "${PREPARE_ARGS[@]}" >"$LOG_DIR/prepare.log" 2>&1 \
     || { echo "prepare failed:" >&2; tail -20 "$LOG_DIR/prepare.log" >&2; exit 1; }
 MOE=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['moe_implementation'])" \
     "$OUTPUT/transformer/config.json")
 STEPS=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['num_steps'])" \
     "$OUTPUT/transformer/config.json")
-echo "prepared $OUTPUT  (moe_implementation=$MOE, num_steps=$STEPS, dtype=$DTYPE)"
+COMPILED=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('compile_denoise_step', False))" \
+    "$OUTPUT/transformer/config.json")
+echo "prepared $OUTPUT  (moe_implementation=$MOE, num_steps=$STEPS, dtype=$DTYPE, compiled=$COMPILED)"
 [[ "$MOE" == "dense" ]] || echo "NOTE: 'gather' measured 3.7x slower than 'dense' on the B60."
 
 # -- serve --------------------------------------------------------------------
@@ -201,8 +211,15 @@ if [[ "$RUN_ATTRIBUTION" == "1" ]]; then
     echo
     echo "== per-stage attribution =="
     if [[ -f spikes/lingbot_vla_v2/phase5_latency.py ]]; then
-        python spikes/lingbot_vla_v2/phase5_latency.py --model "$OUTPUT" \
-            --dtype "$DTYPE" --iters 5 2>"$LOG_DIR/attribution.err" \
+        ATTRIBUTION_ARGS=(--model "$OUTPUT" --dtype "$DTYPE" --iters 5)
+        if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
+            ATTRIBUTION_ARGS+=(
+                --compile-denoise-step
+                --compile-max-relative-error 0.05
+            )
+        fi
+        python spikes/lingbot_vla_v2/phase5_latency.py \
+            "${ATTRIBUTION_ARGS[@]}" 2>"$LOG_DIR/attribution.err" \
             | sed -n '/stage/,$p' | sed 's/^/  /' \
             || { echo "  attribution failed:"; tail -10 "$LOG_DIR/attribution.err"; }
     else
@@ -220,6 +237,7 @@ printf "warm WebSocket, %d requests   median %.3fs  (%.2f Hz)   min %.3fs  max %
 [[ "$OFFLINE" == "skipped" || "$OFFLINE" == "failed" ]] \
     || printf "offline cold request        %ss\n" "$OFFLINE"
 printf "moe_implementation          %s\n" "$MOE"
+printf "compile_denoise_step       %s\n" "$COMPILED"
 printf "Phase 0 kernel reference    %ss/chunk (kernel only, no processor)\n" "$BASELINE_S"
 echo "----------------------------------------------------------------------"
 if [[ "$PASS" == "1" ]]; then
