@@ -24,6 +24,7 @@ MODE="eager"
 # model -- peak activation is 11264 and peak weight 44.3. See
 # `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
 DTYPE="float16"
+ATTENTION_PRECISION="fp16"
 SEED="1234"
 MAX_SAMPLES=""
 EPISODES=""
@@ -43,6 +44,7 @@ Options:
   --model-root PATH   Prepared model prefix (default: $MODEL_ROOT)
   --mode MODE         eager, compiled, or both (default: $MODE)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
+    --attention-precision P  Compiled candidate attention precision (default: $ATTENTION_PRECISION)
   --seed INTEGER      Per-sample noise base seed (default: $SEED)
   --max-samples N     Evaluate only the first N selected samples
   --episodes CSV      Evaluate comma-separated episode IDs, e.g. 0,1,2
@@ -59,6 +61,7 @@ while (($#)); do
         --model-root) MODEL_ROOT="$2"; shift 2 ;;
         --mode) MODE="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
+        --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --max-samples) MAX_SAMPLES="$2"; shift 2 ;;
         --episodes) EPISODES="$2"; shift 2 ;;
@@ -105,7 +108,9 @@ run_mode() {
     local result_dir="${OUTPUT_ROOT}/${mode}"
     local prepare_args=(--checkpoint "$CHECKPOINT" --output "$model_dir")
     if [[ "$mode" == "eager" ]]; then
-        prepare_args+=(--no-compile-denoise-step)
+        prepare_args+=(--no-compile-denoise-step --attention-precision fp32)
+    elif [[ "$ATTENTION_PRECISION" != "fp32" ]]; then
+        prepare_args+=(--attention-precision "$ATTENTION_PRECISION")
     fi
 
     rm -rf "$model_dir" "$result_dir"

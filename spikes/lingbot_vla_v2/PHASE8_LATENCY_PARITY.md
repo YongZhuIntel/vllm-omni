@@ -89,10 +89,70 @@ Ordered by expected return. A is most of the gap; do not start C before A.
 |---|---|---|---|
 | A | **Gate and land the compiled denoise path** | −385 ms model | **done** |
 | B | Locate the Inductor drift (only if A's gate fails) | correctness | skipped; A passed |
-| C | One graph for all 10 steps, as the reference does | −25 to −50 ms | not started |
-| D | Prefix stages: `prefix_fill` 64.5→42, `embed_prefix` 24.7→16 | −31 ms | not started |
+| C | One graph for all 10 steps, as the reference does | −25 to −50 ms | attempted; Inductor cold compile not deployable |
+| D | Prefix stages: `prefix_fill` 64.5→42, `embed_prefix` 24.7→16 | −31 ms | SDPA probe measured; backend blocked |
 | E | The ~165 ms outside the model path | −? served rate | not started |
 | F | Phase 6 step 4 — make the harness able to track all of this | none directly | pending since Phase 6 |
+
+### C. Full-loop capture experiment — not deployable with current Inductor
+
+The Euler loop is now isolated as `denoise_actions()` and the attribution probe
+has an explicit `--compile-denoise-loop` experiment. On the B60, compiling the
+complete 10-step graph with XPU Inductor remained in fullgraph generation for
+more than six minutes without reaching the timed warmup. The existing compiled
+single-step path starts measuring in seconds and delivers 215.6 ms denoise.
+
+This rules out enabling the full-loop `torch.compile` path in the serving
+default: its cold-start cost is not acceptable and no latency result was
+produced. The loop boundary remains useful for a future XPU graph capture or
+precompiled backend, but the next implementation should avoid asking Inductor
+to lower the entire unrolled 36-layer x 10-step graph at runtime.
+
+### D. Prefix attention experiments — partial improvements, no default change
+
+The portable `eager_attention` path was compared with an opt-in
+`--attention-backend sdpa` probe. With denoise compilation disabled, the B60
+measurement was:
+
+| backend | embed_prefix | prefix_fill | denoise | total |
+|---|---:|---:|---:|---:|
+| eager | 24.9 ms | 64.5 ms | 602-ish ms | 680.5 ms |
+| SDPA | 24.8 ms | 58.2 ms | 592.0 ms | 680.5 ms |
+
+SDPA saves about 6.3 ms in prefix fill, but the IPEX runtime warns that xetla
+is unsupported. Combining SDPA with the existing compiled `predict_velocity`
+path fails during Inductor tracing in the XPU scaled-dot-product-attention
+backend. Therefore the production default remains eager attention plus compiled
+denoise; a useful follow-up requires an IPEX xetla-capable SDPA backend or a
+separate prefix-only attention selection so denoise can retain its known-good
+compiled path.
+
+The second probe changed only the attention accumulation dtype while keeping
+the eager attention implementation and compiled denoise path:
+
+| attention precision | embed_prefix | prefix_fill | denoise | total |
+|---|---:|---:|---:|---:|
+| fp32 (default, 20 iters) | 24.8 ms | 66.9 ms | 217.4 ms | 314.6 ms |
+| fp16 (experiment, 20 iters) | 24.8 ms | 57.5 ms | 207.1 ms | 294.7 ms |
+
+Under identical 5-warmup/20-iteration conditions this saves about 19.9 ms
+(`6.3%`) and reduces the vLLM/OpenVINO total ratio from `1.28x` to `1.20x`.
+
+### FP16 attention gate — passed 2026-09-07
+
+The five-seed fp32-reference check gave compiled FP16 attention mean MAE
+`1.990e-02`, below the `2.882e-02` vendor ceiling. The RobotWin six-chunk
+task check also passed:
+
+| candidate | MAE | MSE | cosine |
+|---|---:|---:|---:|
+| eager FP32 attention | `0.00785235` | `0.000505105` | `0.999672920` |
+| compiled FP16 attention | `0.00784798` | `0.000505800` | `0.999672443` |
+
+FP16 attention is now the default in `LingbotVlaV2Config` and prepared models.
+Pass `--attention-precision fp32` for the parity/debug baseline. The eager
+open-loop baseline explicitly remains FP32 so future comparisons do not change
+meaning when the product default changes.
 
 ### A. Gate and land the compiled denoise path — passed 2026-09-07
 

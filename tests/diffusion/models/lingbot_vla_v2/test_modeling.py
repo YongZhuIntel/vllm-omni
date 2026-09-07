@@ -25,6 +25,10 @@ from vllm_omni.diffusion.models.lingbot_vla_v2 import (
     LingbotVlaV2Config,
     LingbotVlaV2ForActionPrediction,
 )
+from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (
+    eager_attention,
+    sdpa_attention,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,6 +40,31 @@ BATCH = 1
 GRID = torch.tensor([[1, 4, 4]] * NUM_CAMS)
 PATCHES = int(GRID[0].prod())
 MASKED_LANG_TOKENS = 3
+
+
+def test_sdpa_attention_matches_eager_attention():
+    torch.manual_seed(0)
+    query = torch.randn(1, 5, 4, HEAD_DIM, dtype=torch.float32)
+    key = torch.randn(1, 5, 2, HEAD_DIM, dtype=torch.float32)
+    value = torch.randn(1, 5, 2, HEAD_DIM, dtype=torch.float32)
+    mask = torch.tril(torch.ones(1, 5, 5, dtype=torch.bool))
+
+    eager = eager_attention(query, key, value, mask)
+    sdpa = sdpa_attention(query, key, value, mask)
+
+    torch.testing.assert_close(sdpa, eager, rtol=1e-5, atol=1e-6)
+
+
+def test_eager_attention_fp16_mask_remains_finite():
+    torch.manual_seed(1)
+    query = torch.randn(1, 5, 4, HEAD_DIM, dtype=torch.float16)
+    key = torch.randn(1, 5, 2, HEAD_DIM, dtype=torch.float16)
+    value = torch.randn(1, 5, 2, HEAD_DIM, dtype=torch.float16)
+    mask = torch.tril(torch.ones(1, 5, 5, dtype=torch.bool))
+
+    output = eager_attention(query, key, value, mask)
+
+    assert torch.isfinite(output).all()
 
 
 def _vlm_config() -> Qwen3VLConfig:

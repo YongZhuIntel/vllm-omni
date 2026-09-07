@@ -228,21 +228,35 @@ def one_request(processor: Any, model: Any, obs: dict, device: torch.device, dty
     t = torch.tensor(1.0, dtype=dtype, device=device)
     x_t = torch.randn((bsize, config.chunk_size, config.max_action_dim), device=device, dtype=dtype)
     step_times: list[float] = []
-    for _ in range(num_steps):
+    if getattr(model, "_benchmark_compile_denoise_loop", False):
         _sync(device)
-        step_start = time.perf_counter()
-        v_t = model.predict_velocity(
+        loop_start = time.perf_counter()
+        x_t = model.denoise_actions(
             state=inputs["state"],
             prefix_pad_masks=pad_masks,
             prefix_position_ids=position_ids,
             past_key_values=past_key_values,
-            x_t=x_t,
-            timestep=t.expand(bsize),
+            noise=x_t,
+            num_steps=num_steps,
         )
-        x_t = x_t + dt * v_t
-        t = t + dt
         _sync(device)
-        step_times.append(time.perf_counter() - step_start)
+        step_times.append(time.perf_counter() - loop_start)
+    else:
+        for _ in range(num_steps):
+            _sync(device)
+            step_start = time.perf_counter()
+            v_t = model.predict_velocity(
+                state=inputs["state"],
+                prefix_pad_masks=pad_masks,
+                prefix_position_ids=position_ids,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=t.expand(bsize),
+            )
+            x_t = x_t + dt * v_t
+            t = t + dt
+            _sync(device)
+            step_times.append(time.perf_counter() - step_start)
     watch._mark = time.perf_counter()
     watch.laps["model.denoise"] = sum(step_times)
 
@@ -253,7 +267,7 @@ def one_request(processor: Any, model: Any, obs: dict, device: torch.device, dty
 
     laps = dict(watch.laps)
     laps["_step_first"] = step_times[0]
-    laps["_step_rest"] = statistics.mean(step_times[1:]) if len(step_times) > 1 else step_times[0]
+    laps["_step_rest"] = statistics.mean(step_times[1:]) if len(step_times) > 1 else step_times[0] / num_steps
     return laps
 
 
@@ -357,6 +371,18 @@ def compile_denoise_step(
         raise RuntimeError("compiled denoise step failed numerical parity")
 
 
+def compile_denoise_loop(model: Any, backend: str) -> None:
+    """Compile the fixed 10-step Euler loop, including its host-side control flow."""
+    print(f"[compile] torch.compile(denoise_actions, backend={backend!r}, dynamic=False, fullgraph=True)")
+    model.denoise_actions = torch.compile(
+        model.denoise_actions,
+        backend=backend,
+        dynamic=False,
+        fullgraph=True,
+    )
+    model._benchmark_compile_denoise_loop = True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -367,9 +393,26 @@ def main() -> int:
     parser.add_argument("--num-steps", type=int, default=None, help="override the flow-matching step count")
     parser.add_argument("--moe", choices=("gather", "dense"), default=None, help="override the MoE kernel")
     parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "sdpa"),
+        default="eager",
+        help="attention implementation for prefix/suffix attribution (default: eager)",
+    )
+    parser.add_argument(
+        "--attention-precision",
+        choices=("fp32", "fp16"),
+        default="fp16",
+        help="attention accumulation precision for attribution (default: fp16)",
+    )
+    parser.add_argument(
         "--compile-denoise-step",
         action="store_true",
         help="compile predict_velocity with a fixed-shape full Inductor graph",
+    )
+    parser.add_argument(
+        "--compile-denoise-loop",
+        action="store_true",
+        help="compile the complete fixed-step Euler loop as one graph",
     )
     parser.add_argument(
         "--compile-backend",
@@ -397,6 +440,13 @@ def main() -> int:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
     processor, model = build(Path(args.model), device, dtype, args.num_steps, args.moe)
+    if args.attention_backend == "sdpa":
+        import vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 as modeling
+
+        modeling.eager_attention = modeling.sdpa_attention
+        print("[attention] backend=sdpa")
+    model.qwenvl_with_expert.attention_precision = args.attention_precision
+    print(f"[attention] precision={args.attention_precision}")
     print(f"[build] moe_implementation={model.config.moe_implementation} num_steps={model.config.num_steps}")
     obs = observation(processor.spec, seed=0)
 
@@ -413,6 +463,10 @@ def main() -> int:
                 args.compile_emulate_precision_casts,
                 args.compile_max_relative_error,
             )
+        if args.compile_denoise_loop:
+            if args.compile_denoise_step:
+                raise ValueError("--compile-denoise-loop cannot be combined with --compile-denoise-step")
+            compile_denoise_loop(model, args.compile_backend)
         for _ in range(args.warmup):
             unsynced_total(processor, model, obs, device, dtype)
 

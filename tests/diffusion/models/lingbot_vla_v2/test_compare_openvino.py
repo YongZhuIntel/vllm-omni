@@ -66,6 +66,8 @@ def test_build_report_records_boundaries_and_ratios():
             "vllm_device": "xpu",
             "vllm_dtype": "float16",
             "compile_denoise_step": True,
+            "attention_backend": "eager",
+            "attention_precision": "fp32",
         },
     )()
     report = compare_openvino.build_report(

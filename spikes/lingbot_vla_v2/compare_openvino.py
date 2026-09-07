@@ -108,6 +108,10 @@ def run_vllm(args: argparse.Namespace, repo: Path) -> tuple[dict[str, float], st
         str(args.warmup),
         "--iters",
         str(args.repeat),
+        "--attention-backend",
+        args.attention_backend,
+        "--attention-precision",
+        args.attention_precision,
     ]
     if args.compile_denoise_step:
         command.extend(
@@ -132,6 +136,8 @@ def build_report(args: argparse.Namespace, ov: dict[str, float], vllm: dict[str,
             "vllm_device": args.vllm_device,
             "vllm_dtype": args.vllm_dtype,
             "vllm_compiled": args.compile_denoise_step,
+            "attention_backend": args.attention_backend,
+            "attention_precision": args.attention_precision,
         },
         "timing_boundaries": {
             "openvino": "vit_prefix + text_prefix + 10-step denoise in one action IR call",
@@ -157,6 +163,8 @@ def main() -> int:
     parser.add_argument("--model", required=True, help="Prepared vLLM model directory")
     parser.add_argument("--vllm-device", default="xpu")
     parser.add_argument("--vllm-dtype", default="float16")
+    parser.add_argument("--attention-backend", choices=("eager", "sdpa"), default="eager")
+    parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--compile-denoise-step", action="store_true")
     parser.add_argument(
         "--vllm-only",

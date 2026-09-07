@@ -251,7 +251,7 @@ def sample(model: Any, inputs: dict, device: torch.device, num_steps: int) -> np
 
 def run_config(
     model_dir: Path, device: torch.device, dtype: torch.dtype, num_steps: int,
-    protocol: str, seeds: list[int], audit: bool, compiled: bool,
+    protocol: str, seeds: list[int], audit: bool, compiled: bool, attention_precision: str = "fp32",
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
 
@@ -260,6 +260,7 @@ def run_config(
     builds -- the build is 4-16 s, the sample 1-15 s.
     """
     processor, model = build(model_dir, device, dtype, num_steps, None)
+    model.qwenvl_with_expert.attention_precision = attention_precision
     if compiled:
         model.predict_velocity = torch.compile(
             model.predict_velocity,
@@ -404,8 +405,17 @@ def main() -> int:
         device_name, dtype_name = parts[:2]
         compiled = len(parts) == 3
         device, dtype = torch.device(device_name), getattr(torch, dtype_name)
-        chunks, audit_report = run_config(model_dir, device, dtype, args.num_steps,
-                                          args.protocol, seeds, args.activation_audit, compiled)
+        chunks, audit_report = run_config(
+            model_dir,
+            device,
+            dtype,
+            args.num_steps,
+            args.protocol,
+            seeds,
+            args.activation_audit,
+            compiled,
+            args.attention_precision,
+        )
         stats = aggregate([metric_stats(ref[s], chunks[s]) for s in seeds])
         stats["timestep_end"] = timestep_drift(dtype, args.num_steps)
         if audit_report is not None:
@@ -440,6 +450,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh-reference", action="store_true")
     parser.add_argument("--activation-audit", action="store_true",
                         help="per-module peak |activation|; run it on a bf16 candidate")
+    parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp16",
+                        help="attention accumulation precision for candidates (default: fp16)")
     parser.add_argument("--out", default=None, help="write the full report as JSON")
     return parser.parse_args()
 

@@ -13,6 +13,8 @@ CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
 MODEL="/tmp/lingbot-vla-v2-perf"
 VLLM_DEVICE="xpu"
 VLLM_DTYPE="float16"
+ATTENTION_BACKEND="eager"
+ATTENTION_PRECISION="fp16"
 WARMUP="5"
 REPEAT="20"
 OUTPUT="/tmp/lingbot-openvino-comparison.json"
@@ -30,6 +32,8 @@ Options:
   --model PATH          Prepared model output directory (default: $MODEL)
   --vllm-device D       vLLM device (default: $VLLM_DEVICE)
   --dtype DTYPE         vLLM dtype (default: $VLLM_DTYPE)
+    --attention-backend D vLLM attention backend (default: $ATTENTION_BACKEND)
+    --attention-precision P attention precision: fp32 or fp16 (default: $ATTENTION_PRECISION)
   --warmup N            vLLM warmup runs (default: $WARMUP)
   --repeat N            vLLM timed runs (default: $REPEAT)
   --output PATH         JSON report path (default: $OUTPUT)
@@ -45,6 +49,8 @@ while (($#)); do
         --model) MODEL="$2"; shift 2 ;;
         --vllm-device) VLLM_DEVICE="$2"; shift 2 ;;
         --dtype) VLLM_DTYPE="$2"; shift 2 ;;
+        --attention-backend) ATTENTION_BACKEND="$2"; shift 2 ;;
+        --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --repeat) REPEAT="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
@@ -85,6 +91,8 @@ COMPARE_ARGS=(
     --model "$MODEL"
     --vllm-device "$VLLM_DEVICE"
     --vllm-dtype "$VLLM_DTYPE"
+    --attention-backend "$ATTENTION_BACKEND"
+    --attention-precision "$ATTENTION_PRECISION"
     --warmup "$WARMUP"
     --repeat "$REPEAT"
     --output "$OUTPUT"

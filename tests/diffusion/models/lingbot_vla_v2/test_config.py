@@ -122,6 +122,7 @@ def test_default_kernels_are_portable():
     config = LingbotVlaV2Config()
     assert config.attention_implementation == "eager"
     assert config.vit_attn_implementation == "sdpa"
+    assert config.attention_precision == "fp16"
 
 
 def test_read_safetensors_shapes_reads_headers_only(tmp_path):

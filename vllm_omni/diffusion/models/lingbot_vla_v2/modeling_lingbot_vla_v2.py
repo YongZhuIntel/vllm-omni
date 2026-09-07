@@ -159,12 +159,46 @@ def eager_attention(
     value = value_states.transpose(1, 2)  # [B, H, Lk, D]
 
     att_weights = torch.matmul(query, key.transpose(-1, -2)) * (head_dim**-0.5)
-    att_weights = torch.where(attention_mask[:, None, :, :], att_weights, BIG_NEG)
+    mask_value = torch.tensor(
+        torch.finfo(att_weights.dtype).min,
+        dtype=att_weights.dtype,
+        device=att_weights.device,
+    )
+    att_weights = torch.where(attention_mask[:, None, :, :], att_weights, mask_value)
     probs = F.softmax(att_weights, dim=-1).to(value.dtype)
 
     att_output = torch.matmul(probs, value)  # [B, H, Lq, D]
     att_output = att_output.transpose(1, 2).reshape(bsize, q_len, num_att_heads * head_dim)
     return att_output
+
+
+def sdpa_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Use PyTorch SDPA for the same grouped-query attention contract.
+
+    This is an opt-in probe because XPU backend selection and fp32 mask
+    behavior must be measured against the portable eager implementation.
+    """
+    bsize, q_len, num_att_heads, head_dim = query_states.shape
+    num_kv_heads = key_states.shape[2]
+    groups = num_att_heads // num_kv_heads
+    if groups > 1:
+        key_states = key_states.repeat_interleave(groups, dim=2)
+        value_states = value_states.repeat_interleave(groups, dim=2)
+
+    output = F.scaled_dot_product_attention(
+        query_states.transpose(1, 2),
+        key_states.transpose(1, 2),
+        value_states.transpose(1, 2),
+        attn_mask=attention_mask[:, None, :, :],
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return output.transpose(1, 2).reshape(bsize, q_len, num_att_heads * head_dim)
 
 
 class RMSNorm(nn.Module):
@@ -756,6 +790,7 @@ class LingbotJointModel(nn.Module):
         self.config = config
         self.qwenvl = Qwen3VLTower(vlm_config)
         self.qwen_expert = ActionExpert(config)
+        self.attention_precision = "fp32"
 
         vlm_layers = vlm_config.text_config.num_hidden_layers
         if vlm_layers != config.expert_num_layers:
@@ -824,12 +859,13 @@ class LingbotJointModel(nn.Module):
                     q, k, v = layer.compute_qkv(hidden_states, ada_cond)
                 else:
                     q, k, v = layer.compute_qkv(hidden_states)
-                # Attention is taken in fp32 for both towers regardless of the
-                # weight dtype: the joint softmax spans 286 prefix tokens plus the
-                # suffix and is where a bf16 run loses the most accuracy.
-                queries.append(q.float())
-                keys.append(k.float())
-                values.append(v.float())
+                # The fp32 path is the numerical reference. fp16 is an explicit
+                # performance experiment for hardware backends that fuse it.
+                if self.attention_precision == "fp32":
+                    q, k, v = q.float(), k.float(), v.float()
+                queries.append(q)
+                keys.append(k)
+                values.append(v)
 
             query_states = torch.cat(queries, dim=1)
             key_states = torch.cat(keys, dim=1)
@@ -1274,9 +1310,33 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        # Time is accumulated rather than recomputed as ``1 + step * dt`` so the
-        # fp32 rounding of the timestep matches the reference implementation the
-        # parity gate compares against.
+        return self.denoise_actions(
+            state=state,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_position_ids=prefix_position_ids,
+            past_key_values=past_key_values,
+            noise=noise,
+            num_steps=num_steps,
+        )
+
+    @torch.no_grad()
+    def denoise_actions(
+        self,
+        state: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_position_ids: torch.Tensor,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
+        noise: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Run the fixed-shape Euler loop over a cached prefix.
+
+        Keeping this boundary separate from ``sample_actions`` allows the loop
+        to be captured as one graph while prefix encoding remains independent.
+        """
+        dtype = state.dtype
+        device = state.device
+        bsize = state.shape[0]
         dt = torch.tensor(-1.0 / num_steps, dtype=dtype, device=device)
         time = torch.tensor(1.0, dtype=dtype, device=device)
         x_t = noise

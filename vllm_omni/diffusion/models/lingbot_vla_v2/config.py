@@ -156,6 +156,9 @@ class LingbotVlaV2Config:
     # portable pure-torch paths are the default here.
     attention_implementation: str = "eager"
     vit_attn_implementation: str = "sdpa"
+    # Phase 8 FP16 attention gate passed: 5-seed fp32-reference mean MAE 1.990e-2
+    # and RobotWin task MAE did not regress. Use fp32 for parity diagnosis.
+    attention_precision: str = "fp16"
     # Inductor reduces the fixed-shape 10-step denoise loop from ~602 ms to
     # ~216 ms on B60. Phase 8 gates fp16 compiled MAE at 1.961e-2 against fp32
     # (below the vendor INT8 ceiling of 2.882e-2) and found no open-loop MAE
@@ -177,6 +180,10 @@ class LingbotVlaV2Config:
             )
         if self.moe_implementation not in ("gather", "dense"):
             raise ValueError(f"moe_implementation must be 'gather' or 'dense'; got {self.moe_implementation!r}.")
+        if self.attention_precision not in ("fp32", "fp16"):
+            raise ValueError(
+                f"attention_precision must be 'fp32' or 'fp16'; got {self.attention_precision!r}."
+            )
         if self.num_backbone_tokens % self.num_task_tokens:
             raise ValueError(
                 f"num_backbone_tokens ({self.num_backbone_tokens}) must be divisible by "
