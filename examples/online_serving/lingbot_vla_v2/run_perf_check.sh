@@ -17,7 +17,11 @@ REPO=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
 OUTPUT="/tmp/lingbot-vla-v2-perf"
 PORT="8000"
-DTYPE="bfloat16"
+# fp16, matching the accuracy path. Phase 5 measured the latency difference at
+# 2.4% -- inside this harness's run-to-run noise -- so this costs nothing here
+# and buys 3.2x on the numerical-equivalence metric. See
+# `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+DTYPE="float16"
 REQUESTS="8"
 STARTUP_TIMEOUT="420"
 TARGET_HZ="1.0"          # M4 acceptance
@@ -236,6 +240,7 @@ printf "warm WebSocket, %d requests   median %.3fs  (%.2f Hz)   min %.3fs  max %
     "${#SAMPLES[@]}" "$MEDIAN" "$HZ" "$MIN" "$MAX"
 [[ "$OFFLINE" == "skipped" || "$OFFLINE" == "failed" ]] \
     || printf "offline cold request        %ss\n" "$OFFLINE"
+printf "dtype                       %s\n" "$DTYPE"
 printf "moe_implementation          %s\n" "$MOE"
 printf "compile_denoise_step       %s\n" "$COMPILED"
 printf "Phase 0 kernel reference    %ss/chunk (kernel only, no processor)\n" "$BASELINE_S"

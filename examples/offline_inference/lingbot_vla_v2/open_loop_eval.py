@@ -82,6 +82,35 @@ def validate_bundle(bundle: OpenLoopBundle) -> None:
         raise ValueError(f"valid_steps must be in [1,{bundle.actions.shape[1]}]")
 
 
+def cosine_per_sample(
+    ground_truth: np.ndarray,
+    prediction: np.ndarray,
+    valid_steps: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-chunk cosine similarity, defined as in the export repo's ``metric_stats``.
+
+    Kept separate from the pooled statistics because cosine is the one metric
+    here that is not elementwise: it needs whole chunks, so it cannot be read
+    off the flat masked error array the others share. Chunks are compared at
+    their valid length, so a padded episode tail cannot inflate the similarity
+    by adding matching zeros to both sides.
+    """
+    reference = ground_truth.astype(np.float32)
+    candidate = prediction.astype(np.float32)
+    if reference.ndim == 3:
+        lengths = (
+            valid_steps if valid_steps is not None else np.full(reference.shape[0], reference.shape[1])
+        )
+        chunks = [(reference[i, :n].reshape(-1), candidate[i, :n].reshape(-1)) for i, n in enumerate(lengths)]
+    else:
+        chunks = [(reference.reshape(-1), candidate.reshape(-1))]
+    cosines = [
+        float(np.dot(ref, out) / np.clip(np.linalg.norm(ref) * np.linalg.norm(out), 1e-12, None))
+        for ref, out in chunks
+    ]
+    return np.asarray(cosines, dtype=np.float64)
+
+
 def prediction_metrics(
     ground_truth: np.ndarray,
     prediction: np.ndarray,
@@ -98,19 +127,34 @@ def prediction_metrics(
         valid_mask = np.arange(error.shape[1])[None, :] < valid_steps[:, None]
         error = error[valid_mask]
 
-    def summarize(values: np.ndarray) -> tuple[float, float]:
-        return float(np.mean(values**2)), float(np.mean(np.abs(values)))
+    def summarize(values: np.ndarray) -> tuple[float, float, float, float]:
+        absolute = np.abs(values)
+        return (
+            float(np.mean(values**2)),
+            float(absolute.mean()),
+            float(absolute.max()),
+            float(np.percentile(absolute, 99)),
+        )
 
-    mse, mae = summarize(error)
-    mse_joint, mae_joint = summarize(error[..., JOINT_INDICES])
-    mse_gripper, mae_gripper = summarize(error[..., GRIPPER_INDICES])
+    mse, mae, max_abs, p99_abs = summarize(error)
+    mse_joint, mae_joint, max_abs_joint, p99_abs_joint = summarize(error[..., JOINT_INDICES])
+    mse_gripper, mae_gripper, max_abs_gripper, p99_abs_gripper = summarize(error[..., GRIPPER_INDICES])
+    cosine = cosine_per_sample(ground_truth, prediction, valid_steps)
     return {
+        "cosine_mean": float(cosine.mean()),
+        "cosine_min": float(cosine.min()),
         "mse": mse,
         "mae": mae,
+        "max_abs": max_abs,
+        "p99_abs": p99_abs,
         "mse_joint": mse_joint,
         "mae_joint": mae_joint,
+        "max_abs_joint": max_abs_joint,
+        "p99_abs_joint": p99_abs_joint,
         "mse_gripper": mse_gripper,
         "mae_gripper": mae_gripper,
+        "max_abs_gripper": max_abs_gripper,
+        "p99_abs_gripper": p99_abs_gripper,
     }
 
 
@@ -142,6 +186,54 @@ def aggregate_metrics(
         "macro": {key: float(np.mean([episode[key] for episode in episodes])) for key in macro_keys},
         "episodes": episodes,
     }
+
+
+REPORT_ROWS = (
+    ("cosine (mean)", "cosine_mean", "{:.6f}"),
+    ("cosine (min)", "cosine_min", "{:.6f}"),
+    ("MAE", "mae", "{:.3e}"),
+    ("MSE", "mse", "{:.3e}"),
+    ("max abs diff", "max_abs", "{:.3e}"),
+    ("p99 abs diff", "p99_abs", "{:.3e}"),
+)
+
+
+def format_report(summary: dict[str, Any]) -> str:
+    """The metric set the OpenVINO export repo reports, over all 14 dims and the two splits.
+
+    The reference here is **dataset ground truth**, so these are task-accuracy
+    numbers in robot command units. They are deliberately *not* comparable to
+    the same-named numbers in `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`, which
+    grade this kernel against a fp32 run of itself in normalized 55-dim units.
+    Same formulas, different reference; putting them in one table would be the
+    single easiest way to draw a wrong conclusion from this script.
+    """
+    micro, macro = summary["micro"], summary["macro"]
+    lines = [
+        "",
+        f"vs dataset ground truth  |  {summary['num_samples']} chunks, "
+        f"{summary['num_episodes']} episodes, {summary['num_valid_steps']} valid steps  |  "
+        f"dtype={summary['dtype']} seed={summary['seed']}",
+        "",
+        f"  {'metric':<15} {'all 14':>12} {'12 joints':>12} {'2 grippers':>12} {'macro (all)':>13}",
+        f"  {'-' * 15} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 13}",
+    ]
+    for label, key, fmt in REPORT_ROWS:
+        # cosine is whole-chunk, so it has no joint/gripper split to report.
+        joint = fmt.format(micro[f"{key}_joint"]) if f"{key}_joint" in micro else "-"
+        gripper = fmt.format(micro[f"{key}_gripper"]) if f"{key}_gripper" in micro else "-"
+        lines.append(
+            f"  {label:<15} {fmt.format(micro[key]):>12} {joint:>12} {gripper:>12} "
+            f"{fmt.format(macro[key]):>13}"
+        )
+    lines += [
+        "",
+        "  macro is the per-episode mean of each metric, so its max/p99 rows are an",
+        "  average worst case per episode and are lower than the pooled figure by",
+        "  construction. cosine is per whole chunk and has no joint/gripper split.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def make_noise(seed: int, sample_index: int) -> tuple[np.ndarray, str]:
@@ -278,7 +370,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             bundle.episode_ids[selected],
             bundle.valid_steps[selected],
         )
-    print(json.dumps(summary["micro"], indent=2))
+    print(format_report(summary))
     return summary
 
 
@@ -290,7 +382,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, nargs="*")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--dtype", default="bfloat16")
+    # fp16 over bf16: the checkpoint is fp32, so bf16 discards three mantissa
+    # bits for nothing. See `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+    parser.add_argument("--dtype", default="float16")
     parser.add_argument("--plots", action="store_true", help="write per-episode GT/prediction PNGs")
     parser.add_argument("--dry-run", action="store_true", help="validate/select data without loading the model")
     args = parser.parse_args()

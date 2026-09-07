@@ -42,7 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Prepared model directory")
     parser.add_argument("--prompt", default="pick up the object")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dtype", default="bfloat16")
+    # fp16 over bf16: see `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+    parser.add_argument("--dtype", default="float16")
     return parser.parse_args()
 
 

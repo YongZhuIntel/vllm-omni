@@ -6,7 +6,12 @@ REPO=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
 OUTPUT="/tmp/lingbot-vla-v2-prepared-openpi"
 PORT="8000"
-DTYPE="bfloat16"
+# fp16, not bf16. This is the deployment entry point, so it has to agree with
+# what the accuracy work was measured on: the checkpoint is fp32, bf16 was
+# discarding three mantissa bits for nothing, and against a fp32 reference bf16
+# scores worse than the OpenVINO path's int8. See
+# `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+DTYPE="float16"
 COMPILE_DENOISE_STEP="0"
 
 usage() {

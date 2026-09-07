@@ -5,7 +5,8 @@ CONTAINER="test-image_zy_b8.3.2_lingbot_omni"
 REPO="/llm/zhuyong/lingbovla/my/vllm-omni"
 CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
 OUTPUT="/tmp/lingbot-vla-v2-prepared"
-DTYPE="bfloat16"
+# fp16 over bf16: see `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+DTYPE="float16"
 PROMPT="pick up the object"
 SEED="0"
 

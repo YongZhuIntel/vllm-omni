@@ -660,3 +660,128 @@ Both eager and compiled paths are internally deterministic. XPU is already in
 exposes `--compile-denoise-step` for controlled A/B runs. The next correctness
 step is open-loop action evaluation; the next compiler step is locating the
 first Inductor-lowered operation that creates the drift.
+
+### 2026-09-04 — step 1: fp16 is not the answer (2.4%)
+
+`--dtype float16` against the bf16 baseline, same harness, same host state.
+The denoise loop moved by **2.4%** — inside run-to-run noise for this harness.
+The reference's `f16` is therefore incidental to its 289 ms, not causal. Closed
+negative; bf16 stays the default because it is the upstream-validated dtype.
+
+> **Revisited 2026-09-07.** Closed negative *as a latency lever*, and that still
+> holds. But fp16 turns out to be the main **accuracy** lever: bf16's 8 mantissa
+> bits put us at mae 4.6e-2 against a fp32 reference, worse than the OpenVINO
+> path's int8. 2.4% is fp16's price, not its product. See `PHASE7_NUMERICS.md`.
+
+### 2026-09-04 — step 5 (early, as a micro): the MoE einsums are not the problem
+
+`phase6_moe_micro.py` runs the action expert's two MoE einsums standalone at the
+real shapes, with no surrounding model. They sustain **13.06 TFLOPS**, which for
+the whole 10-step loop's MoE arithmetic works out to **106.2 ms**. That is real
+device work and it is not recoverable by a better kernel — the einsum
+formulation is already near the card's achievable rate for these shapes. It also
+bounds step 5's upside: the arithmetic saving is real but the kernel is not
+leaving time on the table.
+
+### 2026-09-04 — step 3: the loop is dispatch-bound, and that is the whole gap
+
+`phase6_denoise_profile.py` over one request's denoise loop:
+
+```text
+227465 aten ops
+summed self DEVICE time:     51.0 ms   (what the card actually spent)
+summed self CPU time:      1065.2 ms   (what the host spent dispatching)
+implied per-op floor at 5.1 us submit cost: 1160.1 ms
+
+bucket   calls    dev ms    cpu ms   share
+glue    210557     48.40    855.35   80.3%
+gemm     16908      2.58    209.84   19.7%
+```
+
+93% of the dispatches are glue — `copy_`, `mul`, `cat`, `add`, `view`,
+`as_strided`. Device self time is a **floor**, not a total: `mm`/`einsum` report
+zero on this backend, so combine it with the micro above (106 ms of MoE alone)
+and real device work is ~150–250 ms — i.e. roughly the OpenVINO reference's
+entire 213 ms loop. **The reference is not computing faster. It removed the host
+from the inner loop.** That retires every "what work is done" hypothesis at
+once: int8, top-4 routing, dtype, MoE kernel choice, einsum formulation. Step 2
+(escape eager) is not one option among five; it is the only one.
+
+A methodology note worth keeping: the first run of this profile reported
+"192.9 ms device time", which would have inverted the conclusion. `_self_device_us`
+fell through to `self_cpu_time_total` when the backend reported no device time,
+silently relabelling host time as device time. It was caught because
+`aten::as_strided` showed 0.2 us/call and `as_strided` does no device work. The
+helper now returns `0.0` rather than falling back, and the report prints device
+and CPU as separate columns.
+
+### 2026-09-07 — the open-loop mae 0.62 was the wrong checkpoint, not a port bug
+
+`run_open_loop_eval.log` reported mse 0.665 / mae 0.615. Repointing the runner
+at the RoboTwin fine-tune and changing nothing else:
+
+| checkpoint | mae all | mae active arm | mae idle arm | jerk |
+|---|---:|---:|---:|---:|
+| ground truth | 0 | 0 | 0 | 0.0023 |
+| hold-state baseline | 0.2099 | — | — | 0 |
+| `lingbot-vla-v2-6b` (what ran) | 0.6150 | 0.6533 | 0.7272 | 0.3317 |
+| `…-6b-robotwin/…/hf_ckpt` | **0.0112** | 0.0185 | 0.0068 | 0.0118 |
+
+`lingbot-vla-v2-6b` is the **6B foundation model** — 60k hours of general
+pre-training, never fine-tuned on RoboTwin. `lingbot-vla-v2-6b-robotwin` is the
+RoboTwin 2.0 fine-tune (`checkpoints/global_step_50000/hf_ckpt`), whose own
+README claims 100% on `adjust_bottle`. The two have **identical architecture and
+identical tensor names** (1708 keys, same key set), so the foundation checkpoint
+loads and runs without a single warning. Accuracy is the only signal that tells
+them apart. `run_open_loop_eval.sh` now defaults to the fine-tune and says why.
+
+Every symptom is explained by the checkpoint and nothing else:
+
+* the foundation model predicted **both** arms sweeping — 0.727 mae on the six
+  idle-arm dims where ground truth is exactly `0.0`, and the predicted idle arm
+  was near a mirror of the predicted active arm. The fine-tune keeps it parked
+  (mean `|.|` 0.007). Half the 0.615 came from those six dims alone.
+* the first predicted action sat **0.89 away from the current state**; a policy
+  that knows the action space starts where the robot is. The fine-tune: 0.008
+  (ground truth 0.0017).
+* the chunk was temporally white — jerk 0.33 against ground truth's 0.0023, flat
+  in `num_steps` from 5 to 100 while mae never improved. The fine-tune's jerk is
+  0.0118. That flatness was the tell that the *velocity field* was wrong rather
+  than under-integrated, but it pointed at the weights, not at the integrator.
+
+Things ruled out along the way, each by measurement rather than by reading:
+
+| checked | result |
+|---|---|
+| metric interpretation | mse/mae are **error**; 0.6 is not "60% correct" |
+| bundle export vs raw parquet | exact, max diff 2.22e-16 |
+| ground-truth idle arm all-zero | genuine; this dataset is single-arm per episode |
+| zeroed idle arm out of distribution? | **no** — back-solve the norm-stat means and ~⅓ of training frames also have an arm zeroed; `q01` for those joints is ~0 |
+| normalization round-trip | 4.44e-16 |
+| joint-group slot packing | each group padded to its own `max_dim`; matches upstream |
+| image size / aspect ratio | `img_size` defaults to 256 in the training dataset builder (`lingbotvla/data/dataset.py:89`) *and* the deploy policy, and the RoboTwin yaml sets neither |
+| our resize vs torchvision's | bit-identical, max\|d\| 0 |
+| chat template | `LingbotVLAV2Config` defaults `use_qwen3_chat_template=True` |
+| task in the training mixture | `adjust_bottle` is entry #1 of `robotwin.txt` |
+| Euler direction / suffix attention mask | `t: 1→0`, `dt` negative; `att_masks=[1,1,0,…]` gives all 50 action tokens bidirectional attention |
+| 45-stage forward parity | ~1e-7 relative, fp32 |
+| processor parity on **real** observations | `open_loop_processor_real.py`: bit-exact images/tokens/state, action round-trip 2e-7 |
+
+That last one is new tooling and closes a real gap. `phase2_processor_parity.py`
+graded the processor only on synthetic inputs — a 256x256 noise frame, a
+`standard_normal(14)` state, and the prompt `"pick up the object"` — which
+dodges the resize entirely (the real frames are 240x320), never lands on the
+`q01` floor, and never exercises truncation against `tokenizer_max_length=72`.
+`open_loop_processor_real.py` grades all six kernel inputs plus the action
+round-trip on each of the six real bundle observations.
+
+One incidental quirk found, deliberately **not** changed: in `sample_actions`,
+`dt` and `time` are built in the **model** dtype, so a bf16 run accumulates the
+timestep in bf16. `-1/num_steps` is exactly representable only for `num_steps`
+in {1, 2, 4, …}; at `num_steps=10` the loop's final `t` is `-0.0049` instead of
+`0`, and at 100 it is `-0.0618`. Upstream does exactly the same
+(`modeling_lingbot_vla_v2.py:971,973`, `dtype=dtype`), so promoting the timestep
+to fp32 would make this port *more* correct arithmetically and *less* faithful
+to the reference the parity gate grades against. It is not the cause of anything
+here — the fine-tune scores 0.011 with the same drift. Left as-is; if it is ever
+changed it has to change on both sides at once.

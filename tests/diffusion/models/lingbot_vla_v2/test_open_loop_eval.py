@@ -44,6 +44,39 @@ def test_aggregate_metrics_reports_macro_and_micro():
     assert summary["macro"]["mse"] == pytest.approx(5.0)
 
 
+def test_prediction_metrics_report_the_openvino_metric_set():
+    ground_truth = np.zeros((1, 4, 14), dtype=np.float32)
+    prediction = ground_truth.copy()
+    prediction[0, 0, 0] = 5.0  # one outlier, so max and p99 can diverge from the mean
+    prediction[0, 1:, 0] = 1.0
+
+    metrics = MODULE.prediction_metrics(ground_truth, prediction)
+
+    assert metrics["max_abs"] == pytest.approx(5.0)
+    # Metrics are computed in float64, so the expectation has to be too.
+    assert metrics["p99_abs"] == pytest.approx(np.percentile(np.abs(prediction.astype(np.float64)), 99))
+    assert metrics["max_abs_joint"] == pytest.approx(5.0)
+    assert metrics["max_abs_gripper"] == 0.0
+    # Ground truth is all zeros, so its norm is clipped and cosine collapses to
+    # zero rather than dividing by it.
+    assert metrics["cosine_mean"] == 0.0
+
+
+def test_cosine_uses_whole_chunks_and_ignores_padding():
+    ground_truth = np.zeros((2, 3, 14), dtype=np.float32)
+    ground_truth[:, :, 0] = 1.0
+    prediction = ground_truth.copy()
+    # Sample 0 is exact within its valid step; sample 1 points the other way.
+    prediction[1, :2, 0] = -1.0
+    # Garbage in both padded tails must not reach the metric.
+    prediction[0, 1:] = 100.0
+    prediction[1, 2:] = 100.0
+
+    cosine = MODULE.cosine_per_sample(ground_truth, prediction, valid_steps=np.array([1, 2]))
+
+    assert cosine.tolist() == pytest.approx([1.0, -1.0])
+
+
 def test_metrics_ignore_padded_episode_tail():
     ground_truth = np.zeros((2, 3, 14), dtype=np.float32)
     prediction = ground_truth.copy()

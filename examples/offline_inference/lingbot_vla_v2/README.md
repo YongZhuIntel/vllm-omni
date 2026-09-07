@@ -32,7 +32,7 @@ artifacts; the `.npz` files and Python caches stay out of product commits.
 
 - Released checkpoint: 1632 live tensors loaded, zero missing/unexpected, and
   76 training-only align-head tensors dropped.
-- XPU model memory: 11.7341 GiB in bf16.
+- XPU model memory: 11.7341 GiB (fp16 and bf16 are the same size).
 - Offline output: `type=actions shape=(50, 14) dtype=float32`.
 - Offline example, one cold request with no warmup: 0.891 seconds.
 - OpenPI WebSocket, eight warm requests on one connection: 0.732-0.935 seconds,
@@ -105,9 +105,12 @@ not block LingBot model loading or inference.
   opt-in until open-loop evaluation shows that this numerical envelope is safe.
   `aot_eager` is bit-exact but gives no speedup; Inductor
   `force_same_precision` and `emulate_precision_casts` did not remove the drift.
-2. **Open-loop accuracy benchmark.** Compare predicted action chunks with dataset
-  ground truth using per-episode MSE/MAE, split joint vs. gripper. This is the
-  largest correctness gap for both eager and compiled modes.
+2. **Open-loop accuracy benchmark — done.** Predicted chunks are compared with
+  dataset ground truth using per-episode MSE/MAE, split joint vs. gripper. On
+  the RoboTwin fine-tune the port scores mae **0.0112** against ground truth,
+  versus 0.2099 for a "hold the current state" baseline. The mae 0.615 seen
+  before this was the *foundation* checkpoint being evaluated on RoboTwin data,
+  not a port defect; see step 3 below.
 3. **Machine-readable performance results.** Extend `run_perf_check.sh` to write
   mean/stdev/min/max/p50/p90 plus dtype, MoE mode, compile mode and attention
   backend to JSON.
@@ -242,6 +245,24 @@ The open-loop harness accepts either checkpoint. Scores from the two checkpoints
 must not be compared as if they measured an implementation regression: their
 weights are different.
 
+**Accuracy runs must use the RoboTwin fine-tune.** The two checkpoints have
+identical architecture and identical tensor names (1708 keys, same key set), so
+the base checkpoint loads and runs without a single warning — the score is the
+only thing that tells you which one you loaded. On
+`adjust_bottle_3ep_2chunks.npz`, changing nothing but the checkpoint:
+
+| checkpoint | mse | mae |
+|---|---:|---:|
+| `lingbot-vla-v2-6b` (foundation) | 0.665 | 0.615 |
+| `…-6b-robotwin/…/hf_ckpt` | 0.00061 | **0.0112** |
+
+The foundation model was pre-trained on 60k hours of general robot data and
+never saw RoboTwin's action space; on RoboTwin data it predicts a generic
+bimanual reach, moving the idle arm that the ground truth holds at exactly zero.
+`run_open_loop_eval.sh` therefore defaults to the fine-tune. Use the foundation
+checkpoint for latency and eager-vs-compiled work, where only the runtime
+changes and the weights are irrelevant.
+
 The base checkpoint already used by this port is:
 
 ```text
@@ -317,14 +338,35 @@ python examples/offline_inference/lingbot_vla_v2/open_loop_eval.py \
   --model /tmp/lingbot-robotwin-eager \
   --dataset /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz \
   --output-dir /tmp/robotwin-open-loop-eager \
-  --dtype bfloat16 --seed 1234 --plots
+  --dtype float16 --seed 1234 --plots
 ```
 
-The evaluator writes `metrics.json` and `predictions.npz`. Metrics include
-micro/macro and per-episode MSE/MAE for all 14 dimensions, the 12 arm joints,
-and the two grippers. With `--plots`, it also writes one 14-axis GT/prediction PNG
-per episode. Noise is deterministic per bundle sample and its seed/hash is stored
-with predictions.
+The evaluator writes `metrics.json` and `predictions.npz`. Metrics are
+micro/macro and per-episode, for all 14 dimensions, the 12 arm joints and the
+two grippers, using the same metric set the OpenVINO export repo reports —
+cosine, MAE, MSE, max abs diff, p99 abs diff. It prints them as a table:
+
+```text
+vs dataset ground truth  |  6 chunks, 3 episodes, 300 valid steps  |  dtype=float16 seed=1234
+
+  metric                all 14    12 joints   2 grippers   macro (all)
+  --------------- ------------ ------------ ------------ -------------
+  cosine (mean)       0.999673            -            -      0.999673
+  cosine (min)        0.998926            -            -      0.999390
+  MAE                7.852e-03    8.719e-03    2.653e-03     7.852e-03
+  MSE                5.051e-04    5.708e-04    1.110e-04     5.051e-04
+  max abs diff       2.999e-01    2.999e-01    7.387e-02     1.661e-01
+  p99 abs diff       9.265e-02    9.728e-02    7.094e-02     9.651e-02
+```
+
+**The reference here is dataset ground truth**, in robot command units. These
+are *not* the same numbers as the identically-named ones in
+`spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`, which grade the kernel against a
+fp32 run of itself in normalized 55-dim units. Same formulas, different
+reference — do not put them in one table.
+
+With `--plots`, it also writes one 14-axis GT/prediction PNG per episode. Noise
+is deterministic per bundle sample and its seed/hash is stored with predictions.
 
 Run the same bundle and seed with `/tmp/lingbot-robotwin-compiled`, writing to a
 separate output directory, then compare both result sets. Do not judge the
@@ -336,7 +378,7 @@ python examples/offline_inference/lingbot_vla_v2/open_loop_eval.py \
   --model /tmp/lingbot-robotwin-compiled \
   --dataset /llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz \
   --output-dir /tmp/robotwin-open-loop-compiled \
-  --dtype bfloat16 --seed 1234 --plots
+  --dtype float16 --seed 1234 --plots
 ```
 
 ```bash
@@ -453,9 +495,19 @@ works as a regression gate. `--attribution` adds the per-stage breakdown,
 count, and `--compile-denoise-step` enables the experimental Inductor path. The
 compiled path is default-off because its measured bf16 chunk drift is 1.75%.
 
-The latest repeat measured a 0.411 s warm WebSocket median (2.43 Hz), a 215.6 ms
-denoise loop, and a 311.9 ms synchronized model path. This is close to the
-OpenVINO model-only reference of 289 ms.
+Two measurements, and it matters which is which — the 21.6 ms/step denoise below
+is only reachable with Inductor:
+
+| path | warm median | denoise loop | model path (synced) |
+|---|---:|---:|---:|
+| eager, fp16 | 0.861 s (1.16 Hz) | 602.1 ms (60.1 ms/step) | 696.3 ms |
+| `--compile-denoise-step`, bf16 | 0.411 s (2.43 Hz) | 215.6 ms (21.6 ms/step) | 311.9 ms |
+
+The compiled figure is the one close to the OpenVINO model-only reference of
+289 ms; the default eager path is not. The eager row is the fp16 re-measurement
+taken after the dtype flip, on an idle host, and it matches the bf16 eager
+record it replaces (0.703 s model path, 0.607 s denoise) to within 1% — fp16
+costs nothing here, as Phase 5 predicted.
 
 Two behaviours worth knowing, both learned the hard way:
 
@@ -468,6 +520,34 @@ Two behaviours worth knowing, both learned the hard way:
   `transformer/config.json`. A directory built before a config change silently
   keeps serving the old settings.
 
+## Inference dtype
+
+Every script here defaults to `--dtype float16`. It used to be `bfloat16`, which
+was the wrong default: **the checkpoint is stored in fp32** — all 1708 tensors —
+so bf16 was throwing away three mantissa bits that the weights actually carried,
+in exchange for an exponent range this model never uses.
+
+Measured against our own kernel running at CPU fp32 on identical inputs and
+identical initial noise, over five noise draws, using the export repo's
+`validate_e2e_split.py` metric verbatim (`spikes/lingbot_vla_v2/phase7_numeric_parity.py`):
+
+| path | cosine | MAE | MSE | max abs | p99 abs |
+|---|---:|---:|---:|---:|---:|
+| OpenVINO FP16 (n=1, their number) | 0.998544 | 1.608e-02 | 8.716e-04 | 1.846e-01 | 1.291e-01 |
+| OpenVINO INT8 (n=1, their number) | 0.995633 | 2.882e-02 | 2.604e-03 | 3.135e-01 | 2.089e-01 |
+| vLLM-Omni XPU bf16 | 0.978196 | 6.159e-02 | 1.529e-02 | 1.597e+00 | 4.988e-01 |
+| vLLM-Omni XPU fp16 | 0.998187 | **1.949e-02** | 1.229e-03 | 3.377e-01 | 1.321e-01 |
+
+bf16 was worse than the OpenVINO path's *int8*. fp16 lands on its FP16 column.
+Task accuracy against dataset ground truth moves the same way — mae 0.01125 to
+0.00785 on the RoboTwin bundle.
+
+Two things this is not: it is not a latency lever (Phase 5 measured fp16 against
+bf16 at 2.4%, inside harness noise), and fp16's 65504 ceiling is not a risk here
+(peak activation 11264, peak weight 44.27, zero non-finite values in a full fp16
+run). `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md` has the method and the open
+question about the gripper channel's tail.
+
 ## One-command XPU test
 
 Run the complete preparation and inference flow from the host:
@@ -477,7 +557,7 @@ examples/offline_inference/lingbot_vla_v2/run_xpu_test.sh
 ```
 
 The script defaults to container `test-image_zy_b8.3.2_lingbot_omni`, the local
-6B checkpoint, bf16, and `/tmp/lingbot-vla-v2-prepared`. Run it with `--help`
+6B checkpoint, fp16, and `/tmp/lingbot-vla-v2-prepared`. Run it with `--help`
 to see options for overriding the container, paths, dtype, prompt, and seed.
 
 ## Prepare the model directory
@@ -516,7 +596,7 @@ docker exec test-image_zy_b8.3.2_lingbot_omni sh -lc '
 cd /llm/zhuyong/lingbovla/my/vllm-omni &&
 PYTHONPATH=. python examples/offline_inference/lingbot_vla_v2/lingbot_vla_v2.py \
   --model /tmp/lingbot-vla-v2-prepared \
-  --dtype bfloat16'
+  --dtype float16'
 ```
 
 A successful run prints an action chunk in RobotWin command layout:
@@ -543,7 +623,7 @@ cd /llm/zhuyong/lingbovla/my/vllm-omni &&
 PYTHONPATH=. python -m vllm_omni.entrypoints.cli.main serve \
   /tmp/lingbot-vla-v2-prepared \
   --omni --host 0.0.0.0 --port 8000 \
-  --dtype bfloat16 --enforce-eager --disable-log-stats'
+  --dtype float16 --enforce-eager --disable-log-stats'
 ```
 
 The server wrapper is run directly inside the container's vLLM-Omni checkout. It

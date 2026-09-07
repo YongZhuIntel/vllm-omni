@@ -5,12 +5,25 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
-CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
+# The RoboTwin *fine-tune*, not the 6B foundation checkpoint one directory up.
+# Both have identical architecture and tensor names, so pointing this at
+# `lingbot-vla-v2-6b` loads and runs without complaint -- it just scores mae 0.62
+# instead of 0.011, because the foundation model was pre-trained on 60k hours of
+# general robot data and never saw RoboTwin's action space. Accuracy is the only
+# signal that distinguishes them; use the foundation checkpoint for latency work
+# only.
+CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b-robotwin/checkpoints/global_step_50000/hf_ckpt"
 DATASET="/llm/zhuyong/lingbovla/datasets/open_loop/adjust_bottle_3ep_2chunks.npz"
 OUTPUT_ROOT="/llm/zhuyong/lingbovla/datasets/open_loop/evaluation"
 MODEL_ROOT="/tmp/lingbot-open-loop"
 MODE="eager"
-DTYPE="bfloat16"
+# fp16, not bf16. The checkpoint is stored in fp32, so bf16 was discarding three
+# mantissa bits for no storage reason: against a fp32 reference it scores mae
+# 6.2e-2 where fp16 scores 1.9e-2, and here it costs task accuracy too (mae
+# 0.01125 vs 0.00785 on this bundle). fp16's 65504 ceiling is not a risk for this
+# model -- peak activation is 11264 and peak weight 44.3. See
+# `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
+DTYPE="float16"
 SEED="1234"
 MAX_SAMPLES=""
 EPISODES=""
