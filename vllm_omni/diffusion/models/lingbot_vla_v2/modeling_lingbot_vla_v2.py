@@ -201,6 +201,155 @@ def sdpa_attention(
     return output.transpose(1, 2).reshape(bsize, q_len, num_att_heads * head_dim)
 
 
+def ipex_prefix_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Use vLLM's XPU varlen causal kernel for the valid Prefix tokens.
+
+    LingBot's Prefix mask is causal after padding rows/columns are removed.
+    This path compresses those valid tokens, runs IPEX varlen attention, and
+    restores the original layout for the surrounding transformer code.
+    """
+    if query_states.device.type != "xpu":
+        return eager_attention(query_states, key_states, value_states, attention_mask)
+
+    valid = attention_mask[0].any(dim=0)
+    compressed_mask = attention_mask[:, valid][:, :, valid]
+    length = int(valid.sum())
+    causal = torch.tril(torch.ones((length, length), device=attention_mask.device, dtype=torch.bool))
+    if not torch.equal(compressed_mask[0], causal):
+        raise RuntimeError("LingBot Prefix mask is not compressed causal; refusing IPEX path")
+
+    bsize, q_len, num_att_heads, head_dim = query_states.shape
+    num_kv_heads = key_states.shape[2]
+    groups = num_att_heads // num_kv_heads
+    if groups > 1:
+        key_states = key_states.repeat_interleave(groups, dim=2)
+        value_states = value_states.repeat_interleave(groups, dim=2)
+
+    query = query_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    key = key_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    value = value_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    output = torch.empty_like(query)
+    cu_seqlens = torch.tensor([0, length], device=query.device, dtype=torch.int32)
+    from vllm._ipex_ops import ipex_ops
+
+    ipex_ops.varlen_attention(
+        query,
+        key,
+        value,
+        output,
+        cu_seqlens,
+        cu_seqlens,
+        None,
+        length,
+        length,
+        pdropout=0.0,
+        softmax_scale=head_dim**-0.5,
+        zero_tensors=False,
+        is_causal=True,
+        return_softmax=False,
+        gen_=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        logits_soft_cap=0.0,
+    )
+    restored = torch.zeros((bsize, q_len, num_att_heads, head_dim), device=query.device, dtype=output.dtype)
+    restored[:, valid] = output.view(bsize, length, num_att_heads, head_dim)
+    return restored.reshape(bsize, q_len, num_att_heads * head_dim)
+
+
+def flash_prefix_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Use vLLM-XPU Cutlass varlen FlashAttention for valid Prefix tokens."""
+    if query_states.device.type != "xpu":
+        return eager_attention(query_states, key_states, value_states, attention_mask)
+
+    valid = attention_mask[0].any(dim=0)
+    length = int(valid.sum())
+    compressed_mask = attention_mask[:, valid][:, :, valid]
+    causal = torch.tril(torch.ones((length, length), device=attention_mask.device, dtype=torch.bool))
+    if not torch.equal(compressed_mask[0], causal):
+        raise RuntimeError("LingBot Prefix mask is not compressed causal; refusing FlashAttention path")
+
+    bsize, q_len, num_att_heads, head_dim = query_states.shape
+    num_kv_heads = key_states.shape[2]
+    groups = num_att_heads // num_kv_heads
+    if groups > 1:
+        key_states = key_states.repeat_interleave(groups, dim=2)
+        value_states = value_states.repeat_interleave(groups, dim=2)
+
+    query = query_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    key = key_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    value = value_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    cu_seqlens = torch.tensor([0, length], device=query.device, dtype=torch.int32)
+    from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+
+    output = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        max_seqlen_q=length,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_k=length,
+        cu_seqlens_k=cu_seqlens,
+        softmax_scale=head_dim**-0.5,
+        causal=True,
+        fa_version=2,
+    )
+    restored = torch.zeros((bsize, q_len, num_att_heads, head_dim), device=query.device, dtype=output.dtype)
+    restored[:, valid] = output.view(bsize, length, num_att_heads, head_dim)
+    return restored.reshape(bsize, q_len, num_att_heads * head_dim)
+
+
+def flash_prefix_gqa_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Probe native GQA support in the installed XPU FlashAttention wrapper."""
+    if query_states.device.type != "xpu":
+        return eager_attention(query_states, key_states, value_states, attention_mask)
+
+    valid = attention_mask[0].any(dim=0)
+    length = int(valid.sum())
+    compressed_mask = attention_mask[:, valid][:, :, valid]
+    causal = torch.tril(torch.ones((length, length), device=attention_mask.device, dtype=torch.bool))
+    if not torch.equal(compressed_mask[0], causal):
+        raise RuntimeError("LingBot Prefix mask is not compressed causal; refusing native GQA path")
+
+    bsize, q_len, num_att_heads, head_dim = query_states.shape
+    query = query_states[:, valid].reshape(length, num_att_heads, head_dim).contiguous()
+    key = key_states[:, valid].reshape(length, key_states.shape[2], head_dim).contiguous()
+    value = value_states[:, valid].reshape(length, value_states.shape[2], head_dim).contiguous()
+    cu_seqlens = torch.tensor([0, length], device=query.device, dtype=torch.int32)
+    from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+
+    output = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        max_seqlen_q=length,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_k=length,
+        cu_seqlens_k=cu_seqlens,
+        softmax_scale=head_dim**-0.5,
+        causal=True,
+        fa_version=2,
+    )
+    restored = torch.zeros((bsize, q_len, num_att_heads, head_dim), device=query.device, dtype=output.dtype)
+    restored[:, valid] = output.view(bsize, length, num_att_heads, head_dim)
+    return restored.reshape(bsize, q_len, num_att_heads * head_dim)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with the fp32 reduction the action expert was trained with.
 
@@ -791,6 +940,7 @@ class LingbotJointModel(nn.Module):
         self.qwenvl = Qwen3VLTower(vlm_config)
         self.qwen_expert = ActionExpert(config)
         self.attention_precision = "fp32"
+        self.attention_backend = "eager"
 
         vlm_layers = vlm_config.text_config.num_hidden_layers
         if vlm_layers != config.expert_num_layers:
@@ -879,7 +1029,18 @@ class LingbotJointModel(nn.Module):
                 key_states = torch.cat([cached_key, key_states], dim=1)
                 value_states = torch.cat([cached_value, value_states], dim=1)
 
-            att_output = eager_attention(query_states, key_states, value_states, attention_mask)
+            attention_fn = eager_attention
+            if self.attention_backend == "sdpa" or (
+                self.attention_backend == "prefix_sdpa" and fill_kv_cache
+            ):
+                attention_fn = sdpa_attention
+            elif self.attention_backend == "ipex_prefix" and fill_kv_cache:
+                attention_fn = ipex_prefix_attention
+            elif self.attention_backend == "flash_prefix" and fill_kv_cache:
+                attention_fn = flash_prefix_attention
+            elif self.attention_backend == "flash_prefix_gqa" and fill_kv_cache:
+                attention_fn = flash_prefix_gqa_attention
+            att_output = attention_fn(query_states, key_states, value_states, attention_mask)
 
             outputs, start = [], 0
             for tower_idx, hidden_states in enumerate(inputs_embeds):
@@ -968,6 +1129,12 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
             use_future_video_patch=config.use_future_video_patch,
             future_video_share_future_depth_query=config.future_video_share_future_depth_query,
         )
+
+    def prefix_forward(
+        self, **kwargs
+    ) -> tuple[list[torch.Tensor | None], list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Run the Prefix transformer walk; kept separate for static compilation."""
+        return self.qwenvl_with_expert.forward(**kwargs)
 
     # -- prefix -----------------------------------------------------------
     def _pool_align_tokens(self, table: torch.Tensor) -> torch.Tensor:
@@ -1300,7 +1467,7 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
         ) = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, image_grid_thw)
 
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        _, past_key_values = self.qwenvl_with_expert.forward(
+        _, past_key_values = self.prefix_forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             inputs_embeds=[prefix_embs, None],

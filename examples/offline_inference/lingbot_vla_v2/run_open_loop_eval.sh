@@ -25,6 +25,7 @@ MODE="eager"
 # `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
 DTYPE="float16"
 ATTENTION_PRECISION="fp16"
+COMPILE_PREFIX="0"
 SEED="1234"
 MAX_SAMPLES=""
 EPISODES=""
@@ -45,6 +46,7 @@ Options:
   --mode MODE         eager, compiled, or both (default: $MODE)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
     --attention-precision P  Compiled candidate attention precision (default: $ATTENTION_PRECISION)
+    --compile-prefix        Compile the Prefix walk for the compiled candidate
   --seed INTEGER      Per-sample noise base seed (default: $SEED)
   --max-samples N     Evaluate only the first N selected samples
   --episodes CSV      Evaluate comma-separated episode IDs, e.g. 0,1,2
@@ -62,6 +64,7 @@ while (($#)); do
         --mode) MODE="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
         --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
+        --compile-prefix) COMPILE_PREFIX="1"; shift ;;
         --seed) SEED="$2"; shift 2 ;;
         --max-samples) MAX_SAMPLES="$2"; shift 2 ;;
         --episodes) EPISODES="$2"; shift 2 ;;
@@ -111,6 +114,9 @@ run_mode() {
         prepare_args+=(--no-compile-denoise-step --attention-precision fp32)
     elif [[ "$ATTENTION_PRECISION" != "fp32" ]]; then
         prepare_args+=(--attention-precision "$ATTENTION_PRECISION")
+    fi
+    if [[ "$mode" == "compiled" && "$COMPILE_PREFIX" == "1" ]]; then
+        prepare_args+=(--compile-prefix)
     fi
 
     rm -rf "$model_dir" "$result_dir"

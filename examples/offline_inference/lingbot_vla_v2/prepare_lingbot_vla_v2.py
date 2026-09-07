@@ -32,6 +32,7 @@ def prepare(args: argparse.Namespace) -> Path:
         qwen3vl_path=Path(args.qwen3vl_path).resolve().as_posix(),
     )
     config.compile_denoise_step = args.compile_denoise_step
+    config.compile_prefix = args.compile_prefix
     config.attention_precision = args.attention_precision
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
@@ -93,6 +94,12 @@ def parse_args() -> argparse.Namespace:
         help="compile predict_velocity with Inductor (default: enabled; pass --no-compile-denoise-step for eager)",
     )
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp16")
+    parser.add_argument(
+        "--compile-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="compile the fixed-shape Prefix walk with Inductor (default: disabled)",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 

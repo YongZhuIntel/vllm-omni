@@ -59,6 +59,13 @@ class LingbotVlaV2Pipeline(nn.Module, SupportActionOutput):
         joint_model = getattr(self.transformer, "qwenvl_with_expert", None)
         if joint_model is not None:
             joint_model.attention_precision = self.config.attention_precision
+        if self.config.compile_prefix:
+            self.transformer.prefix_forward = torch.compile(
+                self.transformer.prefix_forward,
+                backend="inductor",
+                dynamic=False,
+                fullgraph=True,
+            )
         if self.config.compile_denoise_step:
             self.transformer.predict_velocity = torch.compile(
                 self.transformer.predict_velocity,

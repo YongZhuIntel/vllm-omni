@@ -251,7 +251,8 @@ def sample(model: Any, inputs: dict, device: torch.device, num_steps: int) -> np
 
 def run_config(
     model_dir: Path, device: torch.device, dtype: torch.dtype, num_steps: int,
-    protocol: str, seeds: list[int], audit: bool, compiled: bool, attention_precision: str = "fp32",
+    protocol: str, seeds: list[int], audit: bool, compiled: bool,
+    attention_precision: str = "fp32", compiled_prefix: bool = False,
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
 
@@ -261,6 +262,13 @@ def run_config(
     """
     processor, model = build(model_dir, device, dtype, num_steps, None)
     model.qwenvl_with_expert.attention_precision = attention_precision
+    if compiled_prefix:
+        model.prefix_forward = torch.compile(
+            model.prefix_forward,
+            backend="inductor",
+            dynamic=False,
+            fullgraph=True,
+        )
     if compiled:
         model.predict_velocity = torch.compile(
             model.predict_velocity,
@@ -415,6 +423,7 @@ def main() -> int:
             args.activation_audit,
             compiled,
             args.attention_precision,
+            args.compile_prefix,
         )
         stats = aggregate([metric_stats(ref[s], chunks[s]) for s in seeds])
         stats["timestep_end"] = timestep_drift(dtype, args.num_steps)
@@ -452,6 +461,8 @@ def parse_args() -> argparse.Namespace:
                         help="per-module peak |activation|; run it on a bf16 candidate")
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp16",
                         help="attention accumulation precision for candidates (default: fp16)")
+    parser.add_argument("--compile-prefix", action="store_true",
+                        help="compile the Prefix walk for each candidate")
     parser.add_argument("--out", default=None, help="write the full report as JSON")
     return parser.parse_args()
 

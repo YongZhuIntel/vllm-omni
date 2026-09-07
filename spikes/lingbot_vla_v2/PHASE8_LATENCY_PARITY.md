@@ -90,7 +90,7 @@ Ordered by expected return. A is most of the gap; do not start C before A.
 | A | **Gate and land the compiled denoise path** | −385 ms model | **done** |
 | B | Locate the Inductor drift (only if A's gate fails) | correctness | skipped; A passed |
 | C | One graph for all 10 steps, as the reference does | −25 to −50 ms | attempted; Inductor cold compile not deployable |
-| D | Prefix stages: `prefix_fill` 64.5→42, `embed_prefix` 24.7→16 | −31 ms | SDPA probe measured; backend blocked |
+| D | Prefix stages: `prefix_fill` 64.5→42, `embed_prefix` 24.7→16 | −31 ms | compiled Prefix gate passed; default blocked by cold start |
 | E | The ~165 ms outside the model path | −? served rate | not started |
 | F | Phase 6 step 4 — make the harness able to track all of this | none directly | pending since Phase 6 |
 
@@ -127,6 +127,56 @@ denoise; a useful follow-up requires an IPEX xetla-capable SDPA backend or a
 separate prefix-only attention selection so denoise can retain its known-good
 compiled path.
 
+The prefix-only selection is available as `--attention-backend prefix_sdpa`.
+It runs without denoise compilation (`prefix_fill` about 50.6 ms in the probe),
+but its cached prefix produces NaNs when passed through the compiled denoise
+parity path. It remains a diagnostic probe, not a deployment option; the
+current XPU stack needs a stable SDPA KV-cache contract before this route can
+be combined with compiled denoise.
+
+### vLLM IPEX varlen Prefix experiment
+
+The reference `/llm/vllm` path exposes `vllm._ipex_ops.ipex_ops.varlen_attention`.
+The real LingBot mask was inspected before using it: the Prefix is `[286,286]`
+with 223 valid tokens, and removing padding gives an exact 223-token causal
+mask (`bad_positions=0`). This makes an IPEX varlen implementation semantically
+possible, so `--attention-backend ipex_prefix` now compresses valid tokens,
+calls the XPU causal kernel, and restores the padded layout.
+
+It is stable but slower on the current B60 runtime:
+
+| path | prefix_fill | denoise | total |
+|---|---:|---:|---:|
+| FP16 eager attention + compiled denoise | 57.6 ms | 205.9 ms | 294.0 ms |
+| IPEX varlen Prefix + compiled denoise | 75.4 ms | 206.3 ms | 311.8 ms |
+
+The IPEX path also showed about 1.1% compiled chunk relative drift. The kernel
+is retained as a diagnostic/reference implementation, but it is not a default
+optimization. The likely next kernel work is a fixed-shape XPU FMHA path that
+avoids per-layer token compression and supports the LingBot GQA layout directly.
+
+`/llm/vllm-xpu-kernels` contains an existing XE2/XE3
+`cutlass_chunk_prefill_interface` with causal varlen prefill,
+`cu_seqlens_q/k`, static maximum sequence lengths, and
+`[seq, heads, head_size]` inputs. This is a better long-term target than the
+current IPEX adapter because it can avoid per-layer compression and restore
+operations.
+
+It is already reachable through the existing
+`vllm_xpu_kernels.flash_attn_varlen_func` binding, so a `flash_prefix` probe was
+added without a new C++ extension. On the current B60 it is stable but not
+faster: `prefix_fill` was about `75.8 ms` versus `57.6 ms` for the existing
+FP16 eager path. The compiled combination also showed about `0.9%` chunk
+relative drift. The remaining optimization is therefore kernel/layout tuning
+inside the XE2 path, not another Python-level backend switch.
+
+A `flash_prefix_gqa` probe also passed native Q/KV head counts directly
+(`32` query heads, `8` KV heads), avoiding the explicit KV repeat. The kernel
+accepted the layout but still measured `prefix_fill` around `73.9 ms`, so KV
+head materialization is not the only bottleneck. The dominant remaining cost
+is the batch-1 short-sequence kernel schedule and per-layer invocation/layout
+overhead; a useful next kernel change must fuse or amortize that overhead.
+
 The second probe changed only the attention accumulation dtype while keeping
 the eager attention implementation and compiled denoise path:
 
@@ -137,6 +187,29 @@ the eager attention implementation and compiled denoise path:
 
 Under identical 5-warmup/20-iteration conditions this saves about 19.9 ms
 (`6.3%`) and reduces the vLLM/OpenVINO total ratio from `1.28x` to `1.20x`.
+
+### Compiled Prefix gate — passed, opt-in only
+
+The fixed-shape 36-layer Prefix walk was compiled as a separate graph through
+`--compile-prefix`. After the first graph build, it reduced `prefix_fill` from
+about `57.6 ms` to `41.2 ms`. Combined with compiled denoise, the synchronized
+model path measured `278.4 ms`, compared with `294.0 ms` without compiled
+Prefix; the OpenVINO comparison is `1.13x` (`278.4 / 246.0`).
+
+Both accuracy gates passed:
+
+| gate | result |
+|---|---:|
+| fp32 reference, 5 noise seeds | `2.015e-02` mean MAE |
+| RobotWin bundle, 6 chunks | `0.00784710` MAE vs eager `0.00785235` |
+| real WebSocket serving | `0.347 s` median, `2.88 Hz` |
+
+The cost is cold start. The real serving harness required `138 s` to become
+ready because Inductor compiled the Prefix graph during initialization. The
+graph is therefore exposed through `--compile-prefix` in the preparation,
+open-loop, and performance scripts, but `compile_prefix` remains false by
+default. Making this the default requires persistent/precompiled graph reuse or
+a substantially cheaper segmented compilation strategy.
 
 ### FP16 attention gate — passed 2026-09-07
 
@@ -153,6 +226,19 @@ FP16 attention is now the default in `LingbotVlaV2Config` and prepared models.
 Pass `--attention-precision fp32` for the parity/debug baseline. The eager
 open-loop baseline explicitly remains FP32 so future comparisons do not change
 meaning when the product default changes.
+
+### Compiled Prefix gate — passed numerically, opt-in for cold-start cost
+
+The Prefix fullgraph path passed the five-seed fp32-reference gate with mean
+MAE `2.015e-02` and the six-chunk RobotWin task gate with MAE `0.00784710`
+versus eager `0.00785235`. Its steady-state model path measured `278.4 ms`
+and the real WebSocket harness measured `0.347 s` median (`2.88 Hz`).
+
+The tradeoff is startup: the real server took `138 s` to become ready because
+the 36-layer Prefix graph compiles during initialization. `--compile-prefix`
+is therefore available in `run_perf_check.sh` and `run_open_loop_eval.sh`, but
+`compile_prefix` remains false by default until the compiled graph can be
+persisted/reused without imposing this startup cost.
 
 ### A. Gate and land the compiled denoise path — passed 2026-09-07
 

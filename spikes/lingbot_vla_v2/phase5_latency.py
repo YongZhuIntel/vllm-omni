@@ -210,7 +210,8 @@ def one_request(processor: Any, model: Any, obs: dict, device: torch.device, dty
     )
     watch.lap("model.embed_prefix")
 
-    _, past_key_values = model.qwenvl_with_expert.forward(
+    prefix_forward = getattr(model, "_benchmark_compiled_prefix", model.qwenvl_with_expert.forward)
+    _, past_key_values = prefix_forward(
         attention_mask=make_att_2d_masks(pad_masks, att_masks),
         position_ids=position_ids,
         inputs_embeds=[embs, None],
@@ -383,6 +384,17 @@ def compile_denoise_loop(model: Any, backend: str) -> None:
     model._benchmark_compile_denoise_loop = True
 
 
+def compile_prefix(model: Any, backend: str) -> None:
+    """Compile the fixed-shape VLM prefix walk for an attribution experiment."""
+    print(f"[compile] torch.compile(prefix_forward, backend={backend!r}, dynamic=False, fullgraph=True)")
+    model._benchmark_compiled_prefix = torch.compile(
+        model.prefix_forward,
+        backend=backend,
+        dynamic=False,
+        fullgraph=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -394,7 +406,7 @@ def main() -> int:
     parser.add_argument("--moe", choices=("gather", "dense"), default=None, help="override the MoE kernel")
     parser.add_argument(
         "--attention-backend",
-        choices=("eager", "sdpa"),
+        choices=("eager", "sdpa", "prefix_sdpa", "ipex_prefix", "flash_prefix", "flash_prefix_gqa"),
         default="eager",
         help="attention implementation for prefix/suffix attribution (default: eager)",
     )
@@ -413,6 +425,11 @@ def main() -> int:
         "--compile-denoise-loop",
         action="store_true",
         help="compile the complete fixed-step Euler loop as one graph",
+    )
+    parser.add_argument(
+        "--compile-prefix",
+        action="store_true",
+        help="compile the complete fixed-shape Prefix transformer walk as one graph",
     )
     parser.add_argument(
         "--compile-backend",
@@ -440,11 +457,8 @@ def main() -> int:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
     processor, model = build(Path(args.model), device, dtype, args.num_steps, args.moe)
-    if args.attention_backend == "sdpa":
-        import vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 as modeling
-
-        modeling.eager_attention = modeling.sdpa_attention
-        print("[attention] backend=sdpa")
+    model.qwenvl_with_expert.attention_backend = args.attention_backend
+    print(f"[attention] backend={args.attention_backend}")
     model.qwenvl_with_expert.attention_precision = args.attention_precision
     print(f"[attention] precision={args.attention_precision}")
     print(f"[build] moe_implementation={model.config.moe_implementation} num_steps={model.config.num_steps}")
@@ -467,6 +481,10 @@ def main() -> int:
             if args.compile_denoise_step:
                 raise ValueError("--compile-denoise-loop cannot be combined with --compile-denoise-step")
             compile_denoise_loop(model, args.compile_backend)
+        if args.compile_prefix:
+            compile_prefix(model, args.compile_backend)
+            print("[compile] warming compiled Prefix path")
+            one_request(processor, model, obs, device, dtype)
         for _ in range(args.warmup):
             unsynced_total(processor, model, obs, device, dtype)
 

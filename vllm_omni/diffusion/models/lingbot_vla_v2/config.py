@@ -165,6 +165,9 @@ class LingbotVlaV2Config:
     # regression, so compiled is the deployment default. Keep eager available
     # for parity diagnosis through --no-compile-denoise-step.
     compile_denoise_step: bool = True
+    # Full Prefix graph compile is experimentally measured at ~41 ms versus
+    # ~58 ms eager on B60, but its accuracy gate is still pending.
+    compile_prefix: bool = False
 
     def __post_init__(self) -> None:
         resolution = self.image_resolution

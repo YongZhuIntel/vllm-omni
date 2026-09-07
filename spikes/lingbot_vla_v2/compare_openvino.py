@@ -163,7 +163,11 @@ def main() -> int:
     parser.add_argument("--model", required=True, help="Prepared vLLM model directory")
     parser.add_argument("--vllm-device", default="xpu")
     parser.add_argument("--vllm-dtype", default="float16")
-    parser.add_argument("--attention-backend", choices=("eager", "sdpa"), default="eager")
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "sdpa", "prefix_sdpa", "ipex_prefix", "flash_prefix", "flash_prefix_gqa"),
+        default="eager",
+    )
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--compile-denoise-step", action="store_true")
     parser.add_argument(
