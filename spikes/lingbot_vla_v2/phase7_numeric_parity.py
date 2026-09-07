@@ -46,6 +46,12 @@ device contributes ~9% and the dtype carries the rest.
     PYTHONPATH=. python spikes/lingbot_vla_v2/phase7_numeric_parity.py \
         --model /tmp/lingbot-open-loop-eager \
         --candidates xpu:bfloat16 --activation-audit
+
+    # Grade the opt-in Inductor path against the same fp32 reference.
+    PYTHONPATH=. python spikes/lingbot_vla_v2/phase7_numeric_parity.py \
+        --model /tmp/lingbot-vla-v2-perf \
+        --candidates xpu:float16 xpu:float16:compiled \
+        --noise-seeds 0 1 2 3 4
 """
 
 from __future__ import annotations
@@ -245,7 +251,7 @@ def sample(model: Any, inputs: dict, device: torch.device, num_steps: int) -> np
 
 def run_config(
     model_dir: Path, device: torch.device, dtype: torch.dtype, num_steps: int,
-    protocol: str, seeds: list[int], audit: bool,
+    protocol: str, seeds: list[int], audit: bool, compiled: bool,
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
 
@@ -254,6 +260,13 @@ def run_config(
     builds -- the build is 4-16 s, the sample 1-15 s.
     """
     processor, model = build(model_dir, device, dtype, num_steps, None)
+    if compiled:
+        model.predict_velocity = torch.compile(
+            model.predict_velocity,
+            backend="inductor",
+            dynamic=False,
+            fullgraph=True,
+        )
     # Only the first seed is audited: the hooks fire on every module of a 6B
     # model, and the peak magnitudes do not depend on the noise draw.
     auditor = ActivationAudit(model) if audit else None
@@ -324,7 +337,7 @@ def reference(args, model_dir: Path, seeds: list[int]) -> dict[int, np.ndarray]:
     if missing:
         print(f"[phase7] building the fp32 CPU reference for seeds {missing} (~25.5 GB RAM) ...")
         fresh, _ = run_config(model_dir, torch.device("cpu"), torch.float32,
-                              args.num_steps, args.protocol, missing, audit=False)
+                              args.num_steps, args.protocol, missing, audit=False, compiled=False)
         cached.update(fresh)
         np.savez(path, num_steps=args.num_steps, protocol=args.protocol,
                  model_dir=str(model_dir), checkpoint=fingerprint,
@@ -385,15 +398,19 @@ def main() -> int:
     report: dict[str, Any] = {"protocol": args.protocol, "num_steps": args.num_steps,
                               "model": str(model_dir), "seeds": seeds, "candidates": {}}
     for spec in args.candidates:
-        device_name, _, dtype_name = spec.partition(":")
+        parts = spec.split(":")
+        if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "compiled"):
+            raise ValueError(f"candidate must be device:dtype or device:dtype:compiled, got {spec!r}")
+        device_name, dtype_name = parts[:2]
+        compiled = len(parts) == 3
         device, dtype = torch.device(device_name), getattr(torch, dtype_name)
         chunks, audit_report = run_config(model_dir, device, dtype, args.num_steps,
-                                          args.protocol, seeds, args.activation_audit)
+                                          args.protocol, seeds, args.activation_audit, compiled)
         stats = aggregate([metric_stats(ref[s], chunks[s]) for s in seeds])
         stats["timestep_end"] = timestep_drift(dtype, args.num_steps)
         if audit_report is not None:
             stats["activation_audit"] = audit_report
-        rows.append((f"ours {device_name}:{dtype_name}", stats))
+        rows.append((f"ours {device_name}:{dtype_name}{' compiled' if compiled else ''}", stats))
         report["candidates"][spec] = stats
 
     print_table(rows)

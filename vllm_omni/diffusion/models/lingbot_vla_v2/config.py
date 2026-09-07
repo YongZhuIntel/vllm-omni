@@ -156,10 +156,12 @@ class LingbotVlaV2Config:
     # portable pure-torch paths are the default here.
     attention_implementation: str = "eager"
     vit_attn_implementation: str = "sdpa"
-    # Opt-in: Inductor reduces the fixed-shape 10-step denoise loop from ~607 ms
-    # to ~215 ms on B60, but changes a bf16 action chunk by ~1.75% relative to
-    # eager. Keep disabled until the deployment accepts that numerical envelope.
-    compile_denoise_step: bool = False
+    # Inductor reduces the fixed-shape 10-step denoise loop from ~602 ms to
+    # ~216 ms on B60. Phase 8 gates fp16 compiled MAE at 1.961e-2 against fp32
+    # (below the vendor INT8 ceiling of 2.882e-2) and found no open-loop MAE
+    # regression, so compiled is the deployment default. Keep eager available
+    # for parity diagnosis through --no-compile-denoise-step.
+    compile_denoise_step: bool = True
 
     def __post_init__(self) -> None:
         resolution = self.image_resolution

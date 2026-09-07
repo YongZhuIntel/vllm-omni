@@ -87,8 +87,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm-stats", default=DEFAULT_NORM_STATS)
     parser.add_argument(
         "--compile-denoise-step",
-        action="store_true",
-        help="compile predict_velocity with Inductor (faster, ~1.75% bf16 chunk drift measured on B60)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile predict_velocity with Inductor (default: enabled; pass --no-compile-denoise-step for eager)",
     )
     parser.add_argument("--output", required=True)
     return parser.parse_args()

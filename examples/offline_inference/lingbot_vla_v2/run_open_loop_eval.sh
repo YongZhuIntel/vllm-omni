@@ -104,8 +104,8 @@ run_mode() {
     local model_dir="${MODEL_ROOT}-${mode}"
     local result_dir="${OUTPUT_ROOT}/${mode}"
     local prepare_args=(--checkpoint "$CHECKPOINT" --output "$model_dir")
-    if [[ "$mode" == "compiled" ]]; then
-        prepare_args+=(--compile-denoise-step)
+    if [[ "$mode" == "eager" ]]; then
+        prepare_args+=(--no-compile-denoise-step)
     fi
 
     rm -rf "$model_dir" "$result_dir"

@@ -99,35 +99,39 @@ not block LingBot model loading or inference.
 
 ### Remaining work
 
-1. **Validate compiled-denoise accuracy.** `--compile-denoise-step` reduces the
-  warm WebSocket median from about 0.70 s to 0.381 s (2.62 Hz), but the Inductor
-  graph changes a 10-step bf16 chunk by 1.75% relative to eager. It remains
-  opt-in until open-loop evaluation shows that this numerical envelope is safe.
-  `aot_eager` is bit-exact but gives no speedup; Inductor
-  `force_same_precision` and `emulate_precision_casts` did not remove the drift.
+1. **Compiled-denoise gate — passed and defaulted.** Five fp16 noise seeds gave
+   compiled MAE `1.961e-02` against fp32, below the predeclared OpenVINO INT8
+   ceiling `2.882e-02`; eager scored `1.949e-02`. On the six-chunk RobotWin
+   bundle, compiled MAE `0.007833` was 0.243% lower than eager `0.007852`.
+   `compile_denoise_step` now defaults to true; pass
+   `--no-compile-denoise-step` to prepare an eager parity/debug baseline.
 2. **Open-loop accuracy benchmark — done.** Predicted chunks are compared with
   dataset ground truth using per-episode MSE/MAE, split joint vs. gripper. On
   the RoboTwin fine-tune the port scores mae **0.0112** against ground truth,
   versus 0.2099 for a "hold the current state" baseline. The mae 0.615 seen
   before this was the *foundation* checkpoint being evaluated on RoboTwin data,
   not a port defect; see step 3 below.
-3. **Machine-readable performance results.** Extend `run_perf_check.sh` to write
+3. **One graph for all ten steps.** The default compiled path still invokes its
+  static `predict_velocity` graph ten times per chunk. Extend the compile
+  boundary over the fixed Euler loop only after retaining the same fp32/open-loop
+  gates; OpenVINO runs the whole loop as one graph.
+4. **Machine-readable performance results.** Extend `run_perf_check.sh` to write
   mean/stdev/min/max/p50/p90 plus dtype, MoE mode, compile mode and attention
   backend to JSON.
-4. **Further compiler work.** The compiled model path is about 311 ms versus the
+5. **Prefix stages.** The compiled model path is about 311 ms versus the
   OpenVINO model-only reference of 289 ms, so the main efficiency gap is nearly
   closed. Localize the remaining Inductor numerical drift before enabling the
   optimization by default.
-5. **Observation validation.** An observation that decodes but lacks a key the
+6. **Observation validation.** An observation that decodes but lacks a key the
   processor needs is only caught in the worker, so the client pays a round trip
   and receives `Internal inference error` rather than the missing key.
-6. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
+7. **Reference risk.** Compare mRoPE position IDs against Transformers 4.57 when
   a matching reference bundle is available; current parity is against the
   Transformers 5.8 environment.
-7. **Deployment convention.** Evaluate moving handshake/runtime settings from a
+8. **Deployment convention.** Evaluate moving handshake/runtime settings from a
   generated `transformer/config.json` to the newer
   `vllm_omni/deploy/<model>.yaml` convention to avoid stale prepared configs.
-8. **Grouped/top-4 MoE is deferred.** Parsing the OpenVINO IR proved that its
+9. **Grouped/top-4 MoE is deferred.** Parsing the OpenVINO IR proved that its
   reference path also computes all 32 experts densely. Grouped routing remains
   a possible algorithmic improvement, but it is not required to match the
   289 ms reference and is no longer the next optimization.

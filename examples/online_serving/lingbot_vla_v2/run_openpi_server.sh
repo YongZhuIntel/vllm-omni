@@ -12,7 +12,7 @@ PORT="8000"
 # scores worse than the OpenVINO path's int8. See
 # `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
 DTYPE="float16"
-COMPILE_DENOISE_STEP="0"
+COMPILE_DENOISE_STEP="1"
 
 usage() {
     cat <<EOF
@@ -26,8 +26,8 @@ Options:
   --output PATH       Prepared model path (default: $OUTPUT)
   --port PORT         Server port (default: $PORT)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
-    --compile-denoise-step
-                                             Enable experimental Inductor denoise compilation
+    --no-compile-denoise-step
+                                             Use eager denoising instead of the default Inductor path
   -h, --help          Show this help
 EOF
 }
@@ -38,7 +38,7 @@ while (($#)); do
         --output) OUTPUT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
-        --compile-denoise-step) COMPILE_DENOISE_STEP="1"; shift ;;
+        --no-compile-denoise-step) COMPILE_DENOISE_STEP="0"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -48,8 +48,8 @@ cd "$REPO"
 export PYTHONPATH=.
 python -m pip install -e . --no-deps
 PREPARE_ARGS=(--checkpoint "$CHECKPOINT" --output "$OUTPUT")
-if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
-    PREPARE_ARGS+=(--compile-denoise-step)
+if [[ "$COMPILE_DENOISE_STEP" == "0" ]]; then
+    PREPARE_ARGS+=(--no-compile-denoise-step)
 fi
 python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
     "${PREPARE_ARGS[@]}"

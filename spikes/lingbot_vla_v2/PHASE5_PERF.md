@@ -620,7 +620,7 @@ IR took two minutes and settled it.
 | # | step | question it answers | status |
 |---|---|---|---|
 | 1 | **fp16 vs bf16 A/B** | The reference runs `f16`; this port runs bf16 because that was the upstream-validated dtype, never because it was measured. On Intel Xe XMX fp16 is the first-class path. One flag, no code. | **done — negative, 2.4%** |
-| 2 | **Escape eager** | The reference submits one static graph for all 36 layers x 10 steps; we dispatch every op from Python, and the server adds `--enforce-eager` on top. Try `torch.compile` on the denoise loop at fixed shapes, and drop `--enforce-eager` if the engine allows it. | **in progress — now the whole phase** |
+| 2 | **Escape eager** | The reference submits one static graph for all 36 layers x 10 steps; we dispatch every op from Python, and the server adds `--enforce-eager` on top. Try `torch.compile` on the denoise loop at fixed shapes, and drop `--enforce-eager` if the engine allows it. | **in progress — moved to `PHASE8_LATENCY_PARITY.md`** |
 | 3 | **Sub-stage attribution inside one layer** | The 2.85x is currently attributed to the loop as a whole. Split one layer into attention / router / MoE einsums / shared expert / norms so the remaining gap has an address. | **done — it is dispatch, not any stage** |
 | 4 | **Perf-script changes** | Make the harness able to track 1-3: a model-only subtotal comparable to the reference's 289 ms, the reference itself printed alongside Phase 0's 0.74 s, p90, and a JSON artifact that can be diffed across runs. | pending |
 | 5 | **Grouped/top-4 MoE** | Deliberately last. It is a real 2.95x arithmetic saving that *neither* implementation collects, but the reference hits 289 ms without it, so it is not on the path to parity. Revisit only once efficiency is fixed. | deferred |
@@ -785,3 +785,30 @@ to fp32 would make this port *more* correct arithmetically and *less* faithful
 to the reference the parity gate grades against. It is not the cause of anything
 here — the fine-tune scores 0.011 with the same drift. Left as-is; if it is ever
 changed it has to change on both sides at once.
+
+### 2026-09-07 — Phase 6 step 2 moved to its own file, and the target number corrected
+
+fp16 re-measurement on an idle host: warm WebSocket median **0.861 s**, model
+path **696.3 ms**, denoise **602.1 ms** at 60.1 ms/step. Same as the bf16 record
+to within 1%, as step 1 predicted.
+
+Against that, the gap decomposes as: denoise +414 ms, `prefix_fill` +22.5,
+`embed_prefix` +8.7, everything else +4.7. **92% of the model-side gap is the
+denoise loop**, which is step 2 and nothing else.
+
+Two corrections while assembling it:
+
+- **The target is 246 ms, not 289 and not 200.** `run_info_demo_dgpu_int8_fmha.log`
+  is the fastest single-device run in the export repo (vit 16 / text 42 / loop
+  188 / total 246). The 289 ms quoted throughout Phase 6 is the *non*-fmha run,
+  and no log anywhere shows 200 ms. Also worth knowing: despite `int8` in the
+  filenames, every one of those runs reports `[precision] f16` with
+  fp16-compressed weights — the reference we are chasing is an fp16 reference,
+  which is one more reason Phase 7's dtype flip was the right move.
+- The `run_info_demo_pipeline.log` figure of 251 ms/sample is not a faster
+  model. It is the same work with the ViT overlapped onto a second GPU, which
+  drops its vit column to 6 ms without speeding anything up.
+
+Step 2 was blocked on an accuracy gate that did not exist when it was written.
+Phase 7 built it. The plan for executing it — including the gate criterion,
+written down before the numbers are read — is `PHASE8_LATENCY_PARITY.md`.

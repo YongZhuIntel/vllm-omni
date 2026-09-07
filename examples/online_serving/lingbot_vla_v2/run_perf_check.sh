@@ -29,7 +29,7 @@ BASELINE_S="0.74"        # Phase 0 bare-kernel reference, for context
 FORCE="0"
 RUN_OFFLINE="1"
 RUN_ATTRIBUTION="0"
-COMPILE_DENOISE_STEP="0"
+COMPILE_DENOISE_STEP="1"
 
 usage() {
     cat <<EOF
@@ -45,8 +45,8 @@ Options:
   --requests N        Measured warm requests, after one discarded (default: $REQUESTS)
   --no-offline        Skip the cold-start offline request
   --attribution       Also print the per-stage breakdown (adds a model load)
-    --compile-denoise-step
-                                             Compile predict_velocity with Inductor (experimental)
+    --no-compile-denoise-step
+                                             Use eager denoising instead of the default Inductor path
   --force             Measure even if the host looks busy
   -h, --help          Show this help
 EOF
@@ -61,7 +61,7 @@ while (($#)); do
         --requests) REQUESTS="$2"; shift 2 ;;
         --no-offline) RUN_OFFLINE="0"; shift ;;
         --attribution) RUN_ATTRIBUTION="1"; shift ;;
-        --compile-denoise-step) COMPILE_DENOISE_STEP="1"; shift ;;
+        --no-compile-denoise-step) COMPILE_DENOISE_STEP="0"; shift ;;
         --force) FORCE="1"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -131,8 +131,8 @@ echo
 echo "== prepare =="
 rm -rf "$OUTPUT"
 PREPARE_ARGS=(--checkpoint "$CHECKPOINT" --output "$OUTPUT")
-if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
-    PREPARE_ARGS+=(--compile-denoise-step)
+if [[ "$COMPILE_DENOISE_STEP" == "0" ]]; then
+    PREPARE_ARGS+=(--no-compile-denoise-step)
 fi
 python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
     "${PREPARE_ARGS[@]}" >"$LOG_DIR/prepare.log" 2>&1 \
