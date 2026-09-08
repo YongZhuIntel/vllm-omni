@@ -201,6 +201,26 @@ def sdpa_attention(
     return output.transpose(1, 2).reshape(bsize, q_len, num_att_heads * head_dim)
 
 
+def sdpa_attention_safe_padding(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Run SDPA after giving fully masked padding queries a self key.
+
+    Valid Prefix queries retain their original mask. Padding queries are never
+    visible as keys to valid queries, so this only prevents an undefined
+    all-masked SDPA softmax from poisoning padding K/V states.
+    """
+    fully_masked = ~attention_mask.any(dim=-1)
+    if fully_masked.any():
+        attention_mask = attention_mask.clone()
+        positions = torch.arange(attention_mask.shape[-1], device=attention_mask.device)
+        attention_mask[:, positions, positions] |= fully_masked
+    return sdpa_attention(query_states, key_states, value_states, attention_mask)
+
+
 def ipex_prefix_attention(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -348,6 +368,72 @@ def flash_prefix_gqa_attention(
     restored = torch.zeros((bsize, q_len, num_att_heads, head_dim), device=query.device, dtype=output.dtype)
     restored[:, valid] = output.view(bsize, length, num_att_heads, head_dim)
     return restored.reshape(bsize, q_len, num_att_heads * head_dim)
+
+
+def flash_suffix_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Run LingBot's suffix mask as state and action FlashAttention calls.
+
+    The state query sees valid Prefix tokens plus itself. Every action query
+    sees valid Prefix tokens plus the complete state/action suffix block. Those
+    two unmasked subproblems exactly describe the released RobotWin mask.
+    """
+    if query_states.device.type != "xpu" or query_states.shape[0] != 1:
+        return eager_attention(query_states, key_states, value_states, attention_mask)
+
+    bsize, suffix_len, num_heads, head_dim = query_states.shape
+    prefix_len = key_states.shape[1] - suffix_len
+    if prefix_len <= 0 or suffix_len < 2:
+        raise RuntimeError("LingBot suffix FlashAttention requires cached Prefix keys and action tokens")
+    valid_prefix = attention_mask[:, 0, :prefix_len]
+    expected_state = torch.cat(
+        [valid_prefix, torch.ones((bsize, 1), dtype=torch.bool, device=query_states.device),
+         torch.zeros((bsize, suffix_len - 1), dtype=torch.bool, device=query_states.device)],
+        dim=1,
+    )
+    expected_actions = torch.cat(
+        [valid_prefix, torch.ones((bsize, suffix_len), dtype=torch.bool, device=query_states.device)], dim=1
+    )
+    if not torch.compiler.is_compiling():
+        if not torch.equal(attention_mask[:, 0], expected_state) or not torch.equal(
+            attention_mask[:, 1:], expected_actions[:, None, :].expand(-1, suffix_len - 1, -1)
+        ):
+            raise RuntimeError("LingBot suffix mask is not the released state/action block layout")
+
+    valid = valid_prefix[0]
+    prefix_key, suffix_key = key_states[:, :prefix_len, :], key_states[:, prefix_len:, :]
+    prefix_value, suffix_value = value_states[:, :prefix_len, :], value_states[:, prefix_len:, :]
+    state_key = torch.cat([prefix_key[:, valid], suffix_key[:, :1]], dim=1)
+    state_value = torch.cat([prefix_value[:, valid], suffix_value[:, :1]], dim=1)
+    action_key = torch.cat([prefix_key[:, valid], suffix_key], dim=1)
+    action_value = torch.cat([prefix_value[:, valid], suffix_value], dim=1)
+
+    from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+
+    def flash(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        query_len, key_len = query.shape[1], key.shape[1]
+        cu_query = torch.tensor([0, query_len], device=query.device, dtype=torch.int32)
+        cu_key = torch.tensor([0, key_len], device=query.device, dtype=torch.int32)
+        return flash_attn_varlen_func(
+            query.reshape(query_len, num_heads, head_dim).contiguous(),
+            key.reshape(key_len, key.shape[2], head_dim).contiguous(),
+            value.reshape(key_len, value.shape[2], head_dim).contiguous(),
+            max_seqlen_q=query_len,
+            cu_seqlens_q=cu_query,
+            max_seqlen_k=key_len,
+            cu_seqlens_k=cu_key,
+            softmax_scale=head_dim**-0.5,
+            causal=False,
+            fa_version=2,
+        ).view(bsize, query_len, num_heads, head_dim)
+
+    state_output = flash(query_states[:, :1], state_key, state_value)
+    action_output = flash(query_states[:, 1:], action_key, action_value)
+    return torch.cat([state_output, action_output], dim=1).reshape(bsize, suffix_len, num_heads * head_dim)
 
 
 class RMSNorm(nn.Module):
@@ -1034,12 +1120,18 @@ class LingbotJointModel(nn.Module):
                 self.attention_backend == "prefix_sdpa" and fill_kv_cache
             ):
                 attention_fn = sdpa_attention
+            elif self.attention_backend == "prefix_sdpa_safe" and fill_kv_cache:
+                attention_fn = sdpa_attention_safe_padding
+            elif self.attention_backend == "suffix_sdpa" and not fill_kv_cache:
+                attention_fn = sdpa_attention
             elif self.attention_backend == "ipex_prefix" and fill_kv_cache:
                 attention_fn = ipex_prefix_attention
             elif self.attention_backend == "flash_prefix" and fill_kv_cache:
                 attention_fn = flash_prefix_attention
             elif self.attention_backend == "flash_prefix_gqa" and fill_kv_cache:
                 attention_fn = flash_prefix_gqa_attention
+            elif self.attention_backend == "flash_suffix" and not fill_kv_cache:
+                attention_fn = flash_suffix_attention
             att_output = attention_fn(query_states, key_states, value_states, attention_mask)
 
             outputs, start = [], 0

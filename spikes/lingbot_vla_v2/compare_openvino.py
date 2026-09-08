@@ -165,7 +165,17 @@ def main() -> int:
     parser.add_argument("--vllm-dtype", default="float16")
     parser.add_argument(
         "--attention-backend",
-        choices=("eager", "sdpa", "prefix_sdpa", "ipex_prefix", "flash_prefix", "flash_prefix_gqa"),
+        choices=(
+            "eager",
+            "sdpa",
+            "prefix_sdpa",
+            "prefix_sdpa_safe",
+            "suffix_sdpa",
+            "ipex_prefix",
+            "flash_prefix",
+            "flash_prefix_gqa",
+            "flash_suffix",
+        ),
         default="eager",
     )
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp32")

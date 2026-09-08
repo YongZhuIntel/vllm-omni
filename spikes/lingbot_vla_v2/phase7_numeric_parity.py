@@ -253,6 +253,7 @@ def run_config(
     model_dir: Path, device: torch.device, dtype: torch.dtype, num_steps: int,
     protocol: str, seeds: list[int], audit: bool, compiled: bool,
     attention_precision: str = "fp32", compiled_prefix: bool = False,
+    attention_backend: str = "eager",
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
 
@@ -262,6 +263,7 @@ def run_config(
     """
     processor, model = build(model_dir, device, dtype, num_steps, None)
     model.qwenvl_with_expert.attention_precision = attention_precision
+    model.qwenvl_with_expert.attention_backend = attention_backend
     if compiled_prefix:
         model.prefix_forward = torch.compile(
             model.prefix_forward,
@@ -424,6 +426,7 @@ def main() -> int:
             compiled,
             args.attention_precision,
             args.compile_prefix,
+            args.attention_backend,
         )
         stats = aggregate([metric_stats(ref[s], chunks[s]) for s in seeds])
         stats["timestep_end"] = timestep_drift(dtype, args.num_steps)
@@ -463,6 +466,15 @@ def parse_args() -> argparse.Namespace:
                         help="attention accumulation precision for candidates (default: fp16)")
     parser.add_argument("--compile-prefix", action="store_true",
                         help="compile the Prefix walk for each candidate")
+    parser.add_argument(
+        "--attention-backend",
+        choices=(
+            "eager", "sdpa", "prefix_sdpa", "suffix_sdpa", "ipex_prefix", "flash_prefix", "flash_prefix_gqa",
+            "flash_suffix"
+        ),
+        default="eager",
+        help="attention backend for candidates (default: eager)",
+    )
     parser.add_argument("--out", default=None, help="write the full report as JSON")
     return parser.parse_args()
 

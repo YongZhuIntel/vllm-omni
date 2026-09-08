@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.lingbot_vla_v2 import (
 from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (
     eager_attention,
     sdpa_attention,
+    sdpa_attention_safe_padding,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -65,6 +66,21 @@ def test_eager_attention_fp16_mask_remains_finite():
     output = eager_attention(query, key, value, mask)
 
     assert torch.isfinite(output).all()
+
+
+def test_safe_padding_sdpa_preserves_valid_queries():
+    torch.manual_seed(2)
+    query = torch.randn(1, 4, 4, HEAD_DIM, dtype=torch.float32)
+    key = torch.randn(1, 4, 2, HEAD_DIM, dtype=torch.float32)
+    value = torch.randn(1, 4, 2, HEAD_DIM, dtype=torch.float32)
+    mask = torch.tril(torch.ones(1, 4, 4, dtype=torch.bool))
+    mask[:, 3] = False
+
+    sanitized = sdpa_attention_safe_padding(query, key, value, mask)
+    expected = sdpa_attention(query[:, :3], key[:, :3], value[:, :3], mask[:, :3, :3])
+
+    torch.testing.assert_close(sanitized[:, :3], expected, rtol=1e-5, atol=1e-6)
+    assert torch.isfinite(sanitized).all()
 
 
 def _vlm_config() -> Qwen3VLConfig:
