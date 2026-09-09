@@ -22,6 +22,16 @@ OUTPUT="/tmp/lingbot-openvino-comparison.json"
 COMPILE_DENOISE_STEP="1"
 COMPILE_PREFIX="0"
 PREPARE_MODEL="1"
+# Pinned, not inherited, so this script measures the same thing whatever the
+# caller's shell happens to export. F6 found that an uncapped intra-op pool
+# costs ~160 ms of *served* median on this hybrid CPU, but that finding does not
+# apply here and this is deliberately recorded rather than assumed: measured
+# 2026-09-09, this script reports total 294.3 ms uncapped and 294.2 ms at 4
+# threads. There is no asyncio loop or websocket thread competing in-process, so
+# the idle pool never takes the dispatch thread's core. The 294 ms reference
+# number in `PHASE8_LATENCY_PARITY.md` is therefore unaffected by the serving
+# fix, and the two scripts stay comparable to their own histories.
+OMP_THREADS="${OMP_NUM_THREADS:-4}"
 
 usage() {
     cat <<EOF
@@ -42,6 +52,7 @@ Options:
   --output PATH         JSON report path (default: $OUTPUT)
   --eager               Use eager vLLM denoising instead of compiled denoising
     --compile-prefix      Compile the fixed-shape Prefix walk with Inductor
+  --omp-threads N       Intra-op thread cap (default: $OMP_THREADS; measured neutral here)
   --no-prepare          Reuse --model instead of preparing it from --checkpoint
   -h, --help            Show this help
 EOF
@@ -61,6 +72,7 @@ while (($#)); do
         --output) OUTPUT="$2"; shift 2 ;;
         --eager) COMPILE_DENOISE_STEP="0"; shift ;;
         --compile-prefix) COMPILE_PREFIX="1"; shift ;;
+        --omp-threads) OMP_THREADS="$2"; shift 2 ;;
         --no-prepare) PREPARE_MODEL="0"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -76,6 +88,7 @@ done
 
 cd "$REPO"
 export PYTHONPATH=.
+export OMP_NUM_THREADS="$OMP_THREADS"
 
 if [[ "$PREPARE_MODEL" == "1" ]]; then
     [[ -d "$CHECKPOINT" ]] || { echo "vLLM checkpoint not found: $CHECKPOINT" >&2; exit 1; }

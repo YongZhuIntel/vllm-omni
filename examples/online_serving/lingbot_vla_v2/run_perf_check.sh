@@ -26,6 +26,15 @@ REQUESTS="8"
 STARTUP_TIMEOUT="420"
 TARGET_HZ="1.0"          # M4 acceptance
 BASELINE_S="0.74"        # Phase 0 bare-kernel reference, for context
+# Intra-op threads. PyTorch defaults to one per logical CPU (12 here) and this
+# request is host-dispatch-bound, so on a hybrid CPU (4 P-cores, 4 E-cores, 4
+# low-power cores with no L3) the oversubscribed pool steals the one dispatch
+# thread that matters about half the time. That made the served latency bimodal
+# -- 328 ms or 502 ms -- and a median hid it for a month. Capping the pool:
+# median 0.486 -> 0.326 s, max 0.507 -> 0.328 s, spread 181 -> 6 ms. Measured in
+# `spikes/lingbot_vla_v2/PHASE8_LATENCY_PARITY.md` under F6, along with the four
+# hypotheses (pacing, GC, KMP_BLOCKTIME, taskset) that were ruled out first.
+OMP_THREADS="${OMP_NUM_THREADS:-4}"
 FORCE="0"
 RUN_OFFLINE="1"
 RUN_ATTRIBUTION="0"
@@ -44,6 +53,7 @@ Options:
   --port PORT         Server port (default: $PORT)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
   --requests N        Measured warm requests, after one discarded (default: $REQUESTS)
+  --omp-threads N     Intra-op thread cap (default: $OMP_THREADS; see comment above)
   --no-offline        Skip the cold-start offline request
   --attribution       Also print the per-stage breakdown (adds a model load)
     --no-compile-denoise-step
@@ -61,6 +71,7 @@ while (($#)); do
         --port) PORT="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
         --requests) REQUESTS="$2"; shift 2 ;;
+        --omp-threads) OMP_THREADS="$2"; shift 2 ;;
         --no-offline) RUN_OFFLINE="0"; shift ;;
         --attribution) RUN_ATTRIBUTION="1"; shift ;;
         --no-compile-denoise-step) COMPILE_DENOISE_STEP="0"; shift ;;
@@ -73,6 +84,7 @@ done
 
 cd "$REPO"
 export PYTHONPATH=.
+export OMP_NUM_THREADS="$OMP_THREADS"
 LOG_DIR=$(mktemp -d /tmp/lingbot-perf.XXXXXX)
 SERVER_LOG="$LOG_DIR/server.log"
 SERVER_PID=""
@@ -248,7 +260,11 @@ printf "warm WebSocket, %d requests   median %.3fs  (%.2f Hz)   min %.3fs  max %
     "${#SAMPLES[@]}" "$MEDIAN" "$HZ" "$MIN" "$MAX"
 [[ "$OFFLINE" == "skipped" || "$OFFLINE" == "failed" ]] \
     || printf "offline cold request        %ss\n" "$OFFLINE"
+printf "spread (max-min)            %.0f ms  %s\n" \
+    "$(awk -v a="$MAX" -v b="$MIN" 'BEGIN {print (a-b)*1000}')" \
+    "$(awk -v a="$MAX" -v b="$MIN" 'BEGIN {print ((a-b) > 0.05) ? "<- WIDE: see F6, check OMP_NUM_THREADS and stray processes" : ""}')"
 printf "dtype                       %s\n" "$DTYPE"
+printf "OMP_NUM_THREADS             %s  (uncapped is ~160 ms slower here, see F6)\n" "$OMP_NUM_THREADS"
 printf "moe_implementation          %s\n" "$MOE"
 printf "compile_denoise_step       %s\n" "$COMPILED"
 printf "compile_prefix             %s\n" "$PREFIX_COMPILED"

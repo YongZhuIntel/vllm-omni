@@ -13,6 +13,17 @@ PORT="8000"
 # `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
 DTYPE="float16"
 COMPILE_DENOISE_STEP="1"
+# Intra-op threads. PyTorch defaults to one per logical CPU (12 on this host),
+# and this request is host-dispatch-bound -- 282.6 of 286.5 ms is CPU, not
+# device. On a hybrid CPU that pool spans P-cores, E-cores and a low-power
+# island with no L3, and roughly half the time the one dispatch thread that
+# matters loses a core to it: served latency goes bimodal, 328 ms or 502 ms.
+# Capping the pool removes it entirely -- median 0.486 -> 0.326 s and the
+# spread collapses from 181 ms to 6 ms. 1, 2 and 4 measure the same, so this is
+# oversubscription rather than OpenMP itself; 4 keeps parallelism for CPU-side
+# preprocessing without exceeding the P-core count. Measured in
+# `spikes/lingbot_vla_v2/PHASE8_LATENCY_PARITY.md` under F6.
+OMP_THREADS="${OMP_NUM_THREADS:-4}"
 
 usage() {
     cat <<EOF
@@ -26,6 +37,7 @@ Options:
   --output PATH       Prepared model path (default: $OUTPUT)
   --port PORT         Server port (default: $PORT)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
+  --omp-threads N     Intra-op thread cap (default: $OMP_THREADS; see comment above)
     --no-compile-denoise-step
                                              Use eager denoising instead of the default Inductor path
   -h, --help          Show this help
@@ -38,6 +50,7 @@ while (($#)); do
         --output) OUTPUT="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
+        --omp-threads) OMP_THREADS="$2"; shift 2 ;;
         --no-compile-denoise-step) COMPILE_DENOISE_STEP="0"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -53,6 +66,8 @@ if [[ "$COMPILE_DENOISE_STEP" == "0" ]]; then
 fi
 python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
     "${PREPARE_ARGS[@]}"
+export OMP_NUM_THREADS="$OMP_THREADS"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS (uncapped costs ~160 ms of served median here; see F6)"
 python -m vllm_omni.entrypoints.cli.main serve "$OUTPUT" \
     --omni --host 0.0.0.0 --port "$PORT" \
     --dtype "$DTYPE" --enforce-eager --disable-log-stats
