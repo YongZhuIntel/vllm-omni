@@ -25,6 +25,7 @@ MODE="eager"
 # `spikes/lingbot_vla_v2/PHASE7_NUMERICS.md`.
 DTYPE="float16"
 ATTENTION_PRECISION="fp16"
+ATTENTION_BACKEND="eager"
 COMPILE_PREFIX="0"
 SEED="1234"
 MAX_SAMPLES=""
@@ -46,6 +47,7 @@ Options:
   --mode MODE         eager, compiled, or both (default: $MODE)
   --dtype DTYPE       Inference dtype (default: $DTYPE)
     --attention-precision P  Compiled candidate attention precision (default: $ATTENTION_PRECISION)
+    --attention-backend B    Compiled candidate backend: eager or suffix_sdpa (default: $ATTENTION_BACKEND)
     --compile-prefix        Compile the Prefix walk for the compiled candidate
   --seed INTEGER      Per-sample noise base seed (default: $SEED)
   --max-samples N     Evaluate only the first N selected samples
@@ -64,6 +66,7 @@ while (($#)); do
         --mode) MODE="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
         --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
+        --attention-backend) ATTENTION_BACKEND="$2"; shift 2 ;;
         --compile-prefix) COMPILE_PREFIX="1"; shift ;;
         --seed) SEED="$2"; shift 2 ;;
         --max-samples) MAX_SAMPLES="$2"; shift 2 ;;
@@ -114,6 +117,9 @@ run_mode() {
         prepare_args+=(--no-compile-denoise-step --attention-precision fp32)
     elif [[ "$ATTENTION_PRECISION" != "fp32" ]]; then
         prepare_args+=(--attention-precision "$ATTENTION_PRECISION")
+    fi
+    if [[ "$mode" == "compiled" && "$ATTENTION_BACKEND" != "eager" ]]; then
+        prepare_args+=(--attention-backend "$ATTENTION_BACKEND")
     fi
     if [[ "$mode" == "compiled" && "$COMPILE_PREFIX" == "1" ]]; then
         prepare_args+=(--compile-prefix)

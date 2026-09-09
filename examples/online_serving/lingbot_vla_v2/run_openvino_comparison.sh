@@ -17,8 +17,10 @@ ATTENTION_BACKEND="eager"
 ATTENTION_PRECISION="fp16"
 WARMUP="5"
 REPEAT="20"
+COMPILE_MAX_RELATIVE_ERROR="0.05"
 OUTPUT="/tmp/lingbot-openvino-comparison.json"
 COMPILE_DENOISE_STEP="1"
+COMPILE_PREFIX="0"
 PREPARE_MODEL="1"
 
 usage() {
@@ -36,8 +38,10 @@ Options:
     --attention-precision P attention precision: fp32 or fp16 (default: $ATTENTION_PRECISION)
   --warmup N            vLLM warmup runs (default: $WARMUP)
   --repeat N            vLLM timed runs (default: $REPEAT)
+    --compile-max-relative-error X  Compiled parity tripwire (default: $COMPILE_MAX_RELATIVE_ERROR)
   --output PATH         JSON report path (default: $OUTPUT)
   --eager               Use eager vLLM denoising instead of compiled denoising
+    --compile-prefix      Compile the fixed-shape Prefix walk with Inductor
   --no-prepare          Reuse --model instead of preparing it from --checkpoint
   -h, --help            Show this help
 EOF
@@ -53,8 +57,10 @@ while (($#)); do
         --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --repeat) REPEAT="$2"; shift 2 ;;
+        --compile-max-relative-error) COMPILE_MAX_RELATIVE_ERROR="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --eager) COMPILE_DENOISE_STEP="0"; shift ;;
+        --compile-prefix) COMPILE_PREFIX="1"; shift ;;
         --no-prepare) PREPARE_MODEL="0"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -95,10 +101,14 @@ COMPARE_ARGS=(
     --attention-precision "$ATTENTION_PRECISION"
     --warmup "$WARMUP"
     --repeat "$REPEAT"
+    --compile-max-relative-error "$COMPILE_MAX_RELATIVE_ERROR"
     --output "$OUTPUT"
 )
 if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
     COMPARE_ARGS+=(--compile-denoise-step)
+fi
+if [[ "$COMPILE_PREFIX" == "1" ]]; then
+    COMPARE_ARGS+=(--compile-prefix)
 fi
 
 python "${COMPARE_ARGS[@]}"

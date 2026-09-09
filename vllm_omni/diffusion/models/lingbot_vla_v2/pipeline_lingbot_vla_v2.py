@@ -59,6 +59,7 @@ class LingbotVlaV2Pipeline(nn.Module, SupportActionOutput):
         joint_model = getattr(self.transformer, "qwenvl_with_expert", None)
         if joint_model is not None:
             joint_model.attention_precision = self.config.attention_precision
+            joint_model.attention_backend = self.config.attention_backend
         if self.config.compile_prefix:
             self.transformer.prefix_forward = torch.compile(
                 self.transformer.prefix_forward,

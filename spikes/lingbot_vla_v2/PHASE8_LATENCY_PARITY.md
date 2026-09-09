@@ -168,6 +168,13 @@ query rows. It is finite and saves about `4.3 ms` on the ten-step loop in a
 result is MAE `1.538e-01` (range `1.347e-01-1.909e-01`), far above the
 `2.882e-02` vendor ceiling. It must not be enabled as a serving backend.
 
+The RobotWin six-chunk open-loop gate confirms the numerical regression is a
+real task regression: eager scored MAE `0.00785235` while compiled
+`suffix_sdpa` scored `0.03108115` (`+295.8%`), with MSE increasing from
+`0.000505105` to `0.002748884`. The open-loop runner can reproduce this with
+`--mode both --attention-backend suffix_sdpa`; it keeps the eager baseline on
+the portable eager backend.
+
 The available XE2 FlashAttention varlen API cannot directly express the mixed
 suffix mask: the state token sees valid Prefix plus itself, while every action
 token sees valid Prefix plus the complete state/action block. A semantically

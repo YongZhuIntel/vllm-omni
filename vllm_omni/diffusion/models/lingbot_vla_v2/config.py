@@ -156,6 +156,7 @@ class LingbotVlaV2Config:
     # portable pure-torch paths are the default here.
     attention_implementation: str = "eager"
     vit_attn_implementation: str = "sdpa"
+    attention_backend: str = "eager"
     # Phase 8 FP16 attention gate passed: 5-seed fp32-reference mean MAE 1.990e-2
     # and RobotWin task MAE did not regress. Use fp32 for parity diagnosis.
     attention_precision: str = "fp16"
@@ -187,6 +188,18 @@ class LingbotVlaV2Config:
             raise ValueError(
                 f"attention_precision must be 'fp32' or 'fp16'; got {self.attention_precision!r}."
             )
+        if self.attention_backend not in (
+            "eager",
+            "sdpa",
+            "prefix_sdpa",
+            "prefix_sdpa_safe",
+            "suffix_sdpa",
+            "ipex_prefix",
+            "flash_prefix",
+            "flash_prefix_gqa",
+            "flash_suffix",
+        ):
+            raise ValueError(f"unsupported attention_backend: {self.attention_backend!r}")
         if self.num_backbone_tokens % self.num_task_tokens:
             raise ValueError(
                 f"num_backbone_tokens ({self.num_backbone_tokens}) must be divisible by "

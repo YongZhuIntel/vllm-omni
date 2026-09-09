@@ -34,6 +34,7 @@ def prepare(args: argparse.Namespace) -> Path:
     config.compile_denoise_step = args.compile_denoise_step
     config.compile_prefix = args.compile_prefix
     config.attention_precision = args.attention_precision
+    config.attention_backend = args.attention_backend
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
     norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
@@ -94,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         help="compile predict_velocity with Inductor (default: enabled; pass --no-compile-denoise-step for eager)",
     )
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp16")
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "suffix_sdpa"),
+        default="eager",
+        help="joint-attention backend (suffix_sdpa is an experimental denoise-only path)",
+    )
     parser.add_argument(
         "--compile-prefix",
         action=argparse.BooleanOptionalAction,

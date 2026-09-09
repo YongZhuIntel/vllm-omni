@@ -121,6 +121,8 @@ def run_vllm(args: argparse.Namespace, repo: Path) -> tuple[dict[str, float], st
                 str(args.compile_max_relative_error),
             ]
         )
+    if args.compile_prefix:
+        command.append("--compile-prefix")
     output = run(command, cwd=repo)
     return parse_stages(output, VLLM_STAGE_PATTERNS, "vLLM"), output
 
@@ -136,6 +138,7 @@ def build_report(args: argparse.Namespace, ov: dict[str, float], vllm: dict[str,
             "vllm_device": args.vllm_device,
             "vllm_dtype": args.vllm_dtype,
             "vllm_compiled": args.compile_denoise_step,
+            "compile_prefix": args.compile_prefix,
             "attention_backend": args.attention_backend,
             "attention_precision": args.attention_precision,
         },
@@ -180,6 +183,7 @@ def main() -> int:
     )
     parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--compile-denoise-step", action="store_true")
+    parser.add_argument("--compile-prefix", action="store_true")
     parser.add_argument(
         "--vllm-only",
         action="store_true",
