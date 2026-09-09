@@ -51,6 +51,10 @@ harness's own 0.746-0.938 s spread.
 36 ms. Any work that is not about the denoise loop is rounding error until the
 denoise loop is fixed.
 
+(The `wall − model path` row is superseded. That ~165 ms was OpenMP
+oversubscription on this hybrid CPU, not transport; with `OMP_NUM_THREADS=4` the
+residual is **~23 ms**, mostly the client sending 576 KiB of frames. See F6.)
+
 ## Why, and what is already proven
 
 Phase 6 step 3 settled the cause and it is not arithmetic
@@ -91,9 +95,11 @@ Ordered by expected return. A is most of the gap; do not start C before A.
 | B | Locate the Inductor drift (only if A's gate fails) | correctness | skipped; A passed |
 | C | One graph for all 10 steps, as the reference does | −25 to −50 ms | **closed 2026-09-08**: no XPU graph API exists and AOTInductor gives 0.99x on the real step, see F3 |
 | D | Prefix stages: `prefix_fill` 64.5→42, `embed_prefix` 24.7→16 | −31 ms | compiled Prefix gate passed; default blocked by cold start |
-| E | The ~165 ms outside the model path | −? served rate | not started |
+| E | The ~165 ms outside the model path — **additive to the 286.5, not inside it** | −160 ms wall | **done 2026-09-09**: OpenMP oversubscription on a hybrid CPU. `OMP_NUM_THREADS=4` landed in the serving and perf scripts. Median 0.486→0.323 s (2.06→3.10 Hz), spread 181→3 ms. Model path unchanged at 294. See F6 |
 | F | Phase 6 step 4 — make the harness able to track all of this | none directly | pending since Phase 6 |
 | H | **Cut MoE weight bytes** — the loop is memory-bound at 51 FLOP/byte against a 207 machine balance | −30 ms to roofline, −30 more at int8 | not started; **the largest reachable item**, see F2 |
+| I | **Hoist loop-invariant work out of the 10 denoise steps** — γ/β FiLM projections, masks, position ids | −8 to −9 ms | not started; measured on the real model, no numerics change, see F4 |
+| J | **Merge `gate_proj` and `up_proj` into one weight** — 2 GEMMs instead of 3, routed and shared experts | −9 to −10 ms | not started; measured **bit-exact** (`max\|Δ\|=0`), stacks with I, see F5 and section J |
 
 Step H displaced a grouped-MoE kernel, which F2 measured and rejected: the FLOP
 argument promises 6.38x and delivers 1.27x, because the MoE streams the same
@@ -402,6 +408,23 @@ Wall 861 ms − model 696 ms. Never attributed. It is not part of the 246 ms
 target, which is model-only, but it is part of the rate a robot actually sees:
 after A it would be roughly a third of the total. Split it into WebSocket
 transport, serialization, and engine scheduling before assuming which one it is.
+
+**Which number is it inside? None of them — it is additive.** Asked 2026-09-09,
+and worth stating once because three numbers get compared loosely in this file:
+
+| number | scope | what it is |
+|---|---:|---|
+| 246 ms | model-only | the OV reference |
+| 294.0 / 286.5 ms | **model path, synced** | ours — F1's `sample_actions` whole-request |
+| ~165 ms | **wall − model path** | transport, serialization, engine scheduling |
+| 861 ms | wall | what the client sees |
+
+So step E sits *outside* the 294/286.5, and every item in the steps table
+(H bytes, I hoist, J gate_up) acts only on the 286.5. The rate a robot sees is
+`model path + E`.
+
+**Re-measured 2026-09-09, and it is now attributed. See F6 — it was OpenMP
+oversubscription on a hybrid CPU, and one environment variable removes ~160 ms.**
 
 ### F. Harness work (Phase 6 step 4, still pending)
 
@@ -848,15 +871,289 @@ capture are different mechanisms, and only the second one addresses F1's
 diagnosis. That is also why the 3.6 GB package is not worth engineering around —
 even a lean export would not change the timing.
 
-**Verdict for step C.** The host tax cannot be recovered from Python today.
-Doing it needs a C++/SYCL extension that binds `ext_oneapi_graph`, records the
-command list once and replays it — real work, against an extension that is still
-moving, for a ceiling that is smaller than it first looks: step C is the loop
-alone, whose host tax over the OV device floor is **~13 ms** (G2), and capturing
-every stage caps out at the whole ~40 ms. Step H is better ranked on both counts:
-larger (up to ~60 ms), and it needs no new runtime binding, with its first 30 ms
-changing no numerics. Revisit if a later `torch-xpu-ops` ships an `XPUGraph`; the
-check is one run of `phase8_graph_probe.py --skip-chain`.
+**Verdict for step C.** The host tax cannot be recovered *by graph capture* from
+Python today. Doing that needs a C++/SYCL extension that binds
+`ext_oneapi_graph`, records the command list once and replays it — real work,
+against an extension that is still moving, for a ceiling that is smaller than it
+first looks: step C is the loop alone, whose host tax over the OV device floor is
+**~13 ms** (G2), and capturing every stage caps out at the whole ~40 ms. Step H
+is better ranked on both counts: larger (up to ~60 ms), and it needs no new
+runtime binding, with its first 30 ms changing no numerics. Revisit if a later
+`torch-xpu-ops` ships an `XPUGraph`; the check is one run of
+`phase8_graph_probe.py --skip-chain`.
+
+But "no graph" is not the same as "no reachable host time" — F4 finds ~9 ms of
+the tax that is reachable from Python, by not submitting the work at all.
+
+### F4. Loop-invariant work inside the denoise loop — ~9 ms, reachable, 2026-09-09
+
+Anatomy of one denoise step first, since the finding falls out of it. The suffix
+is 51 tokens (1 state + `chunk_size=50`); the action expert is 36 layers of
+`expert_hidden_size=768`, `expert_num_attention_heads=32` /
+`expert_num_key_value_heads=8` / `expert_head_dim=128`, MoE with
+`token_num_experts=32`, `token_top_k=4`, `token_moe_intermediate_size=512`, a
+shared expert at `expert_intermediate_size=2752`, and `adanorm_time=True`.
+Per layer, per step, at fp16:
+
+| what | weights read | note |
+|---|---|---|
+| 32 routed experts (gate/up/down) | 75.50 MB | all 32 read regardless of routing — F2 |
+| attention q/k/v/o | 15.73 MB | 768→4096, 768→1024 ×2, 4096→768 |
+| shared expert (gate/up/down) | 12.68 MB | 768 × 2752 × 3 |
+| `AdaRMSNorm` γ/β, 2 norms | 4.72 MB | 4 × 768 × 768 |
+| router gate | 0.05 MB | 768 × 32 |
+| | **108.7 MB** | × 36 layers = 3.91 GB per step |
+
+Plus the prefix KV cache, 286 slots × 8 kv-heads × 128 × 2 × 36 layers =
+42.2 MB per step. So the loop's DRAM floor is (3.91 + 0.04) × 10 / 449 GB/s =
+**~88 ms of the measured 201.4 ms** — the loop runs at 44% of roofline, and F2's
+60.5 ms routed-expert figure is the largest part of that 88, not all of it.
+
+Now the finding. `predict_velocity` (`:1615`) is called ten times, and some of
+what it recomputes each time cannot depend on the step:
+
+| recomputed per step | actually depends on | invariant? |
+|---|---|---|
+| `make_att_2d_masks` + `cat` + `_block_query_columns` (`:1632-1635`) | the prefix/suffix pad masks | **yes** — identical all 10 steps |
+| `_build_full_position_ids` (`:1637`) | the prefix position ids | **yes** |
+| `state_proj(state)` (`:1466`) | the observation | **yes** |
+| `AdaRMSNorm.gamma(cond)` / `.beta(cond)` (`:489-490`) | the timestep only | **yes, per timestep** — and all 10 timesteps are known before the loop starts |
+| `action_in_proj` / `action_time_mlp_*` | `x_t` | no |
+| everything in the 36 layers | `x_t` | no |
+
+`torch.compile` cannot hoist any of it: each step is a separate call into the
+same compiled graph, so Inductor CSEs *within* a step and re-runs everything
+across steps. The γ/β pair is the interesting one — 72 `AdaRMSNorm` modules × 2
+Linears = **144 `[1,768]×[768,768]` matmuls per step, 1440 per request**, whose
+only input is the timestep.
+
+Measured, real model, compiled, fp16, eager attention, 3 warmup + 10 iterations:
+
+| | denoise (10 steps) |
+|---|---|
+| today, γ/β recomputed every step | 200.8 / 200.7 / 200.7 ms |
+| γ/β as a cached lookup (timing proxy) | 193.3 / 193.4 / 193.7 ms |
+| | **−7.0 to −7.5 ms (1.036–1.039x)** |
+
+and separately, the strictly step-invariant masks + position ids measure
+0.146–0.173 ms/step, of which 9/10 is redundant → **1.3–1.6 ms**. Together
+**~8–9 ms**, on a 286.5 ms request, changing no arithmetic: precompute γ/β for
+the 10 timesteps in one batched `[10,768]` call before the loop and index per
+step; build the masks and position ids once and pass them in. Measured by
+`phase8_loop_invariant_probe.py`.
+
+Two cautions, one of which cost a 3x error:
+
+* **A microbenchmark of the 144 matmuls in isolation says 24.2–24.9 ms →
+  2.4 ms, i.e. ~22 ms.** The real model gives 7.0–7.5. The isolated version
+  overstates by 3x
+  because in the real graph Inductor fuses most of those tiny Linears into
+  surrounding kernels, so their marginal launch cost is already partly paid.
+  Always land this class of estimate on the real step.
+* The proxy above replaces γ/β with a cached tensor from one timestep, so its
+  output is numerically wrong on purpose (`max|Δ| ≈ 2.78`). It measures the
+  runtime of a lookup versus two matmuls, which is what a correct precompute
+  would pay. A real implementation must be graded on the Phase 7 metric like
+  anything else, though it should be bit-comparable: same ops, batched.
+
+This is the first piece of the host dispatch tax shown to be reachable without a
+graph API, and the mechanism generalises — the question "what in this loop does
+not depend on the loop variable?" has not been asked of the other stages.
+
+### F5. Merging `gate_proj` and `up_proj` — ~9 ms, bit-exact, 2026-09-09
+
+Prompted by Intel's π0.5 report (section J), whose `FuseGatedMLP` pass collapses
+the gate/Swish/multiply/up/down subgraph into one oneDNN primitive. We cannot
+write a oneDNN primitive from PyTorch, but half of that pass is reachable:
+`gate_proj` and `up_proj` read the *same* input and differ only in weights, so
+concatenating them along the output axis replaces two GEMMs with one of twice
+the N. Measured on our exact shapes:
+
+| | today, 3 GEMMs | merged gate_up, 2 GEMMs | speedup | ×360 invocations | max\|Δ\| |
+|---|---|---|---|---|---|
+| routed experts, `[32,51,768]×[32,768,512]` | 0.2538 ms | 0.2395 ms | 1.060x | 91.4 → 86.2 ms | 0 |
+| shared expert, `[51,768]×[768,2752]` | 0.0599 ms | 0.0477 ms | 1.256x | 21.5 → 17.2 ms | 0 |
+
+**≈ 9–10 ms total (5.2 + 4.4), and `max|Δ| = 0` — bit-identical output.** The two
+are independent of step I and stack with it. (An ad-hoc first pass measured
+1.051x/1.273x → 9.0 ms; the table above is the committed probe's, run-to-run
+spread on these shapes is ~±0.5 ms on the request total.)
+
+Two things worth noting:
+
+* **The shared expert gains far more than the routed experts** (1.26x vs 1.06x)
+  even though it is 6x fewer bytes. Its GEMMs are `[51,768]` — small enough that
+  launch and setup dominate, which is precisely the regime Intel's report
+  attributes 104 µs of dispatch latency to. The routed path is already a batched
+  `bmm` over 32 experts, so it is nearer bandwidth-bound and merging buys less.
+* This is a weight-layout change, not a kernel change: `[E,H,I]` + `[E,H,I]` →
+  `[E,H,2I]`, done once at load time, with a `.split(I)` on the output. It
+  touches `GroupedExperts` (`modeling_lingbot_vla_v2.py:788-822`) and the shared
+  expert, and must be mirrored in `load_weights`.
+
+Measured by `phase8_gated_mlp_probe.py`.
+
+### F6. Step E resolved — OpenMP oversubscription on a hybrid CPU, −160 ms, 2026-09-09
+
+Step E's "~165 ms outside the model path" was measured once in the eager era and
+never revisited. Re-measured on the compiled path, it is **not transport and not
+scheduling**: it is the host CPU, and it is fixed by one environment variable.
+
+#### What the wall time actually looked like
+
+`run_perf_check.sh --attribution`, idle host, compiled denoise, 8 warm requests:
+wall median **0.486 s** against a **294.2 ms** model path — a 192 ms residual,
+*larger* than the 165 it was supposed to be. But the samples were not scattered
+around a mean, they were **bimodal**: `326, 339, 349` against
+`480, 493, 505, 505, 507`. Widened to 40 samples over one connection:
+
+```
+322 323 323 324 325 326 326 327 329 329 330 331 332 333 333 333   <- 16 fast, mean 328
+384 410 410 434 442 452                                            <-  6 between
+484 495 497 498 498 498 500 501 501 501 502 503 503 508 508 512 512 514  <- 18 slow, mean 502
+```
+
+**A 174 ms gap, ~45% of requests, in no temporal pattern.** A median is the wrong
+summary of this distribution, which is why one number hid it for a month.
+
+#### Localising it
+
+Instrumenting the client (`pack` / `send` / `recv` / `unpack`) put it server-side:
+`pack` 0.11 ms, `unpack` 0.05 ms, `send` 29–35 ms **in both modes**, and the whole
+174 ms inside the wait for the reply. Timing `ServingRealtimeRobotOpenPI.infer`
+on the server narrowed it to `engine_client.generate()` itself: fast 309 ms,
+slow 477 ms. So it is inside the request, not in transport, queueing, or the
+websocket.
+
+#### What it is not
+
+| hypothesis | test | result |
+|---|---|---|
+| engine-loop phase / queueing | 0.1 / 0.3 / 1.0 s idle gaps between requests | **no effect** — still ~45% slow at 1 s pacing |
+| Python GC on a large tensor graph | `gc.collect(); gc.freeze(); gc.disable()` | **no effect** — spread unchanged |
+| Intel OpenMP spin-wait (default `KMP_BLOCKTIME=200ms`, suspiciously close to 174) | `KMP_BLOCKTIME=0` | **no effect** — spread 203 ms |
+| the scheduler parking the thread off the P-cores | `taskset -c 0-3` | **no effect** — spread 196 ms |
+
+#### What it is
+
+This host is a **hybrid CPU** — `Intel Core Ultra 5 338H`, the same Panther Lake
+family as the paper in section J — with three core classes and no SMT:
+
+| cpus | class | max MHz | `cpu_capacity` | L3 |
+|---|---|---|---|---|
+| 0–3 | P | 4700 | 1024 | yes |
+| 4–7 | E | 3600 | 695 | yes |
+| 8–11 | LPE | 3300 | 637 | **no** |
+
+F1 established that this request is **host-dispatch-bound**: 282.6 ms of 286.5 ms
+is CPU, not device. So its latency scales with *which core class the work lands
+on*, and the capacity ratio 1024/637 = **1.607** matches the observed slow/fast
+ratio 502/328 = **1.53–1.60**. Pinning the server to the LPE island confirms the
+mechanism from the other end: **577–772 ms**, i.e. 1.94x, worse than capacity
+alone because the LPE island has no L3.
+
+The trigger is that **PyTorch defaults to 12 intra-op threads** here
+(`torch.get_num_threads() == 12`) — one per logical CPU, so the pool spans all
+three islands. The oversubscribed pool competes with the single dispatch thread
+that actually matters, and roughly half the time that thread loses.
+
+#### The fix, measured
+
+40 samples per configuration, each in its own process group on an idle host:
+
+| config | server `infer()` p50 | spread (max−min) | wall p50 | wall max |
+|---|---:|---:|---:|---:|
+| baseline (12 threads) | 362 ms | **189 ms** | 395 | 520 |
+| `taskset -c 0-3` | 363 ms | 196 ms | 387 | 517 |
+| `KMP_BLOCKTIME=0` | 453 ms | 203 ms | 486 | 528 |
+| `OMP_NUM_THREADS=4` | 299 ms | 5 ms | 324 | 326 |
+| `OMP_NUM_THREADS=2` | 300 ms | 7 ms | 324 | 329 |
+| `OMP_NUM_THREADS=1` | 300 ms | 5 ms | 324 | 327 |
+
+**1, 2 and 4 are indistinguishable**, so the problem is oversubscription at the
+default, not OpenMP itself. **4 is the recommendation** — it stays inside the
+P-core count and leaves parallelism for CPU-side preprocessing.
+
+Through the official harness, `OMP_NUM_THREADS=1`:
+
+```
+warm WebSocket, 8 requests   median 0.326s  (3.07 Hz)   min 0.322s  max 0.328s
+   (baseline the same day:   median 0.486s  (2.06 Hz)   min 0.326s  max 0.507s)
+offline cold request         0.291s   (baseline 0.476s)
+per-stage total (synced)     302.6 ms
+```
+
+**−160 ms at the median, −179 ms at the max, and the run-to-run spread collapses
+from 181 ms to 6 ms.** No model change, no numerics change, one environment
+variable. For a robot the tail matters more than the median, and the tail is what
+this fixes.
+
+#### What step E actually is, now
+
+`326 ms wall − 302.6 ms model = ~23 ms`. Broken down by the probe against an
+`OMP_NUM_THREADS=4` server (40 requests, all 320–326 ms, spread 7 ms):
+
+| | ms |
+|---|---:|
+| `pack` (msgpack the observation) | 0.10 |
+| `send` (**576 KiB**, 3 cameras × 256×256×3, over the websocket) | 22.85 |
+| `wait` (server: unpack + preprocess + model + pack) | 300.06 |
+| `unpack` (the 50×14 action chunk) | 0.06 |
+| **wall** | **323** |
+
+So step E is a **~23 ms** item and it is almost entirely the client shipping
+576 KiB of images — not engine scheduling, not serialization of the reply, and
+nothing worth moving to the iGPU. If it ever matters, the lever is the payload
+(JPEG the frames, or send at the 224×224 the model resizes to anyway), not
+another device.
+
+#### Methodology note, because this nearly went in wrong
+
+A first pass at this concluded that P-core pinning was the fix (p50 457→361).
+It was contamination: three earlier manually-started servers were still alive,
+two spinning at ~100% CPU, because the kill patterns were matching `sys.argv` set
+*inside* Python rather than the OS command line, and because the model actually
+runs in a spawned child process. Re-run with one server per process group and a
+refusal check on stray processes, `taskset` does **nothing**. This is exactly the
+failure mode Rule 2 and `run_perf_check.sh`'s orphan check exist for, and it
+caught nothing here only because the harness was bypassed. Every number in this
+section is from a run that verified an empty process table and `load1 < 2.0`
+first.
+
+#### Landed
+
+| file | change |
+|---|---|
+| `run_openpi_server.sh` | `OMP_NUM_THREADS` defaults to 4, `--omp-threads N` to override; prints the value it used |
+| `run_perf_check.sh` | same default and flag, plus two new report lines: `spread (max-min)` and `OMP_NUM_THREADS`. A spread above 50 ms now prints `<- WIDE: see F6, check OMP_NUM_THREADS and stray processes` |
+| `run_openvino_comparison.sh` | pins the same default so the script measures the same thing regardless of the caller's shell — **not** because it needs it, see below |
+
+`spread` is now a first-class output because the whole failure was a distribution
+that a median could not show. The tripwire is validated: the same harness, same
+host, back to back —
+
+```
+--omp-threads 12   median 0.467s  min 0.324  max 0.522   spread 198 ms  <- WIDE fires
+--omp-threads 4    median 0.323s  min 0.322  max 0.325   spread   3 ms
+```
+
+#### Does this change `run_openvino_comparison.sh`? No — measured, not assumed
+
+That script measures the model path **in-process**, with no asyncio loop or
+websocket thread to compete, so the idle pool never takes the dispatch thread's
+core. Run both ways on 2026-09-09:
+
+| | vit | text | denoise | **total** |
+|---|---:|---:|---:|---:|
+| uncapped (12 threads) | 24.8 | 57.5 | 206.6 | **294.3** |
+| `OMP_NUM_THREADS=4` | 25.0 | 57.6 | 206.7 | **294.2** |
+
+Identical. **The 294 ms model-path reference and the 1.20x-vs-OpenVINO ratio are
+unaffected by this fix**, so every earlier number in this document remains
+comparable. The gain is entirely in the serving path, which is exactly where
+step E lived.
+
+Measured by `phase8_serving_latency_probe.py`.
 
 ## G. dGPU + iGPU — evaluated and rejected for latency, 2026-09-08
 
@@ -994,6 +1291,7 @@ the stages:
 | ViT camera batch in `embed_prefix` | **yes, and free** | `flat_images = images.reshape(bsize * num_images, ...)` (`:1286`) — the cameras are independent rows of one ViT call. One transfer back, no collective. |
 | Tensor parallel in `prefix_forward` | yes, not free | 36 layers × 2 all-reduces |
 | Sequence parallel over the prefix | yes, not free | 286 padded / 223 valid tokens, all-gather per layer |
+| Sequence parallel over the 50 action tokens | yes, and **worse than not free** | the cost does not scale with token count — halving the rows saves 13%, not 50%. Priced in G5. |
 | Tensor parallel in `predict_velocity` | yes, very not free | 36 layers × 2 all-reduces × **10 steps** = 720 collectives |
 | CFG / guidance branch parallel | **no** | Flow matching predicts one velocity; there is no cond/uncond pair, so `diffusion/distributed/cfg_parallel.py` has nothing to split |
 | Across denoise steps | **no** | `x_t = x_t + dt * v_t` (`:1512`) — Euler is sequential by definition |
@@ -1361,6 +1659,186 @@ proof is on making that number better, not on the design.
 Until then the answer to "best performance" is the single-device work already in
 this document: A landed (294 ms model path), and C/D/E are what remains between
 us and 246 ms. There is no dual-device shortcut past them.
+
+### G5. Splitting the 50 action tokens across the two devices — 2026-09-09
+
+G2 enumerated tensor parallel and prefix sequence parallel. The axis it did not
+price is the one the chunk itself suggests: the suffix is 51 tokens (1 state +
+`chunk_size=50` actions), all 50 predicted at once — so why not give the iGPU
+half of them? This subsection prices it, and the answer is different from, and
+stronger than, G2's generic argument.
+
+#### The 50 points are already parallel, but the 10 steps are not
+
+Two axes get conflated. Within one denoise step the 50 action tokens are one
+tensor — `embed_suffix` (`:1451`) builds `[B, 51, 768]` and `predict_velocity`
+(`:1615`) runs all 51 rows through 36 layers in a single call. So they are
+already fully parallel on the dGPU; there is no serialisation to remove. Across
+the 10 steps they are strictly sequential: `x_t = x_t + dt * v_t` (`:1611`) is
+explicit Euler, so step *n+1*'s input is step *n*'s output. Nothing can overlap
+there, on either device.
+
+#### The 50 tokens are also coupled, at every layer
+
+`embed_suffix`' docstring is explicit: `att_masks = [True, True, False, ...]`, so
+the state token opens one block and the first action token opens another that
+**the remaining 49 share bidirectionally**. Every action token attends to every
+other action token, in all 36 layers. Splitting rows across devices is therefore
+not a partition — it is sequence parallelism, and each device needs the other
+half's suffix K/V before every layer's attention. 26 × 8 kv-heads × 128 fp16 =
+53 KiB per tensor, K and V, both directions: 36 layers × 10 steps × 2 = **720
+collectives**, the same count G2 priced at 36 ms through the USM host round-trip
+against a 20 ms ceiling.
+
+#### But the decisive objection is that splitting rows does not split the cost
+
+F2 established that the loop is memory-bound on expert weights, and weight bytes
+are set by the *union* of experts the co-processed tokens select — not by how many
+tokens there are. Both dominant DRAM streams in the loop have this property:
+
+| stream | bytes per denoise step | scales with token count? |
+|---|---|---|
+| routed expert weights, 36 layers | 271.7 MB (all 32 experts, dense kernel) | **no** — same weights whether 51 rows or 1 |
+| prefix KV cache, 36 layers × 286 slots | 42.2 MB | **no** — every query row reads the same cache |
+| suffix activations | ~0.1 MB | yes, and negligible |
+
+So halving the rows halves the FLOPs, which are free at AI = M = 51 against a
+machine balance of 207, and leaves the bytes — which are the cost — untouched.
+Measured, same harness as F2 (`phase8_moe_gemm_probe.py`, warm, 200 iterations):
+
+| M rows/expert | ms/layer-step | × 360 = loop ms | |
+|---|---|---|---|
+| 51 | 0.251 | 90.4 | whole chunk on the dGPU, today |
+| 26 | 0.219 | 78.8 | the dGPU's half of a 26/25 split |
+| 13 | 0.204 | 73.5 | a quarter |
+| 2 | 0.190 | 68.6 | the limit: essentially pure weight streaming |
+
+**Giving away half the tokens buys 13% of the time** (M=26 costs 87% of M=51).
+The fitted M → 0 intercept is 0.188 ms, i.e. **75% of the MoE GEMM cost is
+independent of how many action tokens are processed** — it is weight streaming,
+consistent with F2's 60.5 ms DRAM floor being 67% of the 90.4 ms.
+
+This breaks G2's split model rather than merely losing under it. `wall =
+max(t(1−x), t·k·x)` assumes divisible work; here the dGPU's cost is nearly flat
+in `x`, so even a **free** iGPU with **zero** communication caps the total saving
+at the 25% that scales — 22.7 ms of the 90.4 ms MoE GEMM time, of which a 50/50
+split gets 11.6 ms. Meanwhile the iGPU's own half would take 78.8 × 9.29 ≈ 730 ms
+at G2's measured `k`, and total DRAM traffic roughly doubles, because each device
+streams the full 2.7 GB of expert weights per request instead of one device
+streaming it once.
+
+#### The same fact read forwards, which *is* useful
+
+Cost being flat in token count is only bad news for splitting. Read the other
+direction it says the chunk is underfilled: `chunk_size` could grow, or several
+requests could share the rows, almost for free. That is F2's batching result from
+the other side — B=2 costs 1.19x for 2× the tokens (M=51 → 102 is 0.252 → 0.299),
+and the crossover where bandwidth stops being free is B=4 (AI = 204 ≈ balance
+207). The lever the flatness points at is step H (fewer bytes per weight
+element), not a second device.
+
+Measured by `phase8_moe_gemm_probe.py`; the M=26/13 rows and the intercept fit
+were added on 2026-09-09 for this question.
+
+#### Verdict
+
+Rejected, on a stronger basis than G2's. The 50 points are already computed in
+parallel; the 10 steps cannot be; and the rows cannot usefully be divided because
+the work is bytes, the bytes are weights, and the weights do not care how many
+tokens read them.
+
+## J. Intel's π0.5 optimization report — what transfers, 2026-09-09
+
+Asked whether the optimizations in *Optimizing π0.5 Vision–Language–Action
+Robotic Model on Intel® Core™ Ultra Series 3 Processor*
+([article](https://docs.openedgeplatform.intel.com/2026.1/OEP-articles/publications/optimizing-pi0.5-lva-model.html),
+[PDF](https://docs.openedgeplatform.intel.com/shared_media/publication-optimize-pi0.5-paper.pdf))
+apply to us. Several do; one is already done; the headline architectural one does
+not, and the paper says so itself.
+
+### Read the differences first, or the numbers mislead
+
+|  | their setup | ours |
+|---|---|---|
+| device | Panther Lake X7 358H iGPU (12 Xe3 cores, 123 INT8 TOPS) + 50 TOPS NPU, 154 GB/s **shared** LPDDR5 | discrete B60, 160 Xe-cores, 22.71 GiB @ 449 GB/s, over PCIe |
+| action expert | π0.5's `gemma_300m`, **dense**, **4% of compute** (the VLM backbone is 95%) | 36 **MoE** layers, 3.91 GB/step, **~70% of our latency** |
+| result | 555 → **172 ms** (3.2x), 90% LIBERO | 861 → 286.5 ms so far, OV reference 246 ms |
+
+Their AE being 4% of compute and ours being 70% of time is the single most
+important difference: their optimization *priorities* do not transfer, but their
+*mechanisms* do. Everything below is sorted by whether it survives that.
+
+### Transfers, and one is now measured
+
+| their item | what it is | our status |
+|---|---|---|
+| **§4.6 FuseGatedMLP** | GPU plugin detects gate-proj/Swish/multiply/up/down and emits one oneDNN `GatedMLP` primitive. They quote **~104 µs per discrete kernel dispatch**, and say the gain is "particularly pronounced within the iterative π0.5 action head, which executes a dense sequence of small-dimension Gated-MLP operations", moving the workload "from being memory-bandwidth or latency-bound to compute-bound" while "preserving the model's exact computational integrity". | **Directly applicable and the best find here.** We run 360 gated-MLP invocations per request in a dispatch-bound loop. We cannot emit a oneDNN primitive from PyTorch, but the reachable half — merging `gate_proj` and `up_proj` — is **measured at ~9–10 ms, bit-exact, in F5**. |
+| **§4.2 INT8 weight-only compression** | "reduced the model size by half and improved inference speed by more than 30%, **all without needing calibration data**" | **Third-party confirmation of step H**, and it names the cheapest variant. Our own roofline says the loop is memory-bound at AI 51 against machine balance 207, so halving weight bytes should move nearly proportionally. Weight-only + no calibration also removes the objection that quantization needs a data pipeline we do not have. |
+| **§4.5 SDPA fusion** | fuses the broadcast/reshape *preceding* SDPA into one kernel, never materialising the broadcast tensor, and transposes the output in register space | Our `sdpa_attention` still does an explicit `repeat_interleave` for GQA — the exact materialization they remove. Not yet sized. Note this is orthogonal to section D: D rejected *changing the attention backend* on accuracy; this is about not materializing a tensor, which is numerically neutral. |
+| **§4.4 row-major weight layout** | for weights exceeding cache, to preserve DRAM page locality | Plausible for our 271.7 MB/step expert stream, but Inductor/oneDNN already choose layouts; we have no lever short of the weight-prepacking F5 touches. Low priority, and F5 is the natural place to test it. |
+| **§4.7 profiling observations** | on the Xe3p iGPU: "The Gated-MLP in AE shows memory-bandwidth-limited behaviour with high utilization due to repeated denoising steps"; "AE attention projection layers are affected by dispatch overhead due to small token sizes" | Not an optimization, but it independently reproduces both of our diagnoses — F2 (bandwidth) and F1/F4 (dispatch) — on different silicon and a different framework. |
+
+### Already done
+
+**§4.3 vision encoder** — batch all cameras into a single SigLIP call rather than
+one call per camera; they report 66.7% of parameter traffic removed at three
+cameras. We already do this: `embed_prefix` reshapes to
+`flat_images = images.reshape(bsize * num_images, ...)`
+(`modeling_lingbot_vla_v2.py:1286`) and runs one ViT call.
+
+### Does not transfer — and their paper agrees
+
+**§5 heterogeneous execution** puts VE+LE on the iGPU and the AE on the NPU, with
+"the per-layer KV cache as the only cross-device handoff in shared system
+memory", zero-copy through OpenVINO's USM-host remote-tensor API, and "no
+adjustments to model weights or retraining are necessary". This is the closest
+thing in the literature to G/G2/G4, and it does not reach us:
+
+* **We have no NPU and no shared memory.** Their zero-copy handoff is a pointer
+  pass in one LPDDR pool; ours would be a PCIe copy. G2 priced the equivalent at
+  36 ms against a 20 ms ceiling.
+* **Their own conclusion is ours.** Verbatim: *"In this scenario, partitioning
+  does not reduce latency; only architectural advantages are achieved."* It
+  converts `TVE + TLE + TAE` into `max(TVE + TLE, TAE)` only *across refills* —
+  which is exactly G4's cross-request pipelining, not intra-request latency. They
+  add that "since the iGPU and NPU share a single memory controller, each device
+  experiences reduced throughput under concurrent workloads" and that "max()
+  represents an upper bound on savings, not an exact forecast". Both cautions are
+  G4's, written independently.
+* **Scope note they give:** the split is "applicable to any VLA featuring a
+  separable action head conditioned on backbone KV (such as the pi-family) but is
+  not suitable for autoregressive action-token models like the RT-2 family". Ours
+  is separable; that is not the binding constraint for us.
+
+### One thing we should adopt as vocabulary, not code
+
+**RTC (real-time chunking)** frames asynchronous chunk generation as an
+*inpainting* problem: while the robot executes the current chunk, the next one is
+generated with its leading slots frozen to the tail of the previous chunk and the
+remainder inpainted, with partial attention over the overlap. Caveat they state:
+"its accuracy diminishes when the inference delay grows large relative to the
+chunk size."
+
+This is the named, published mechanism for what G3 sketched as client-side chunk
+pipelining. It does not change G3's numbers, but it means the idea has a
+reference implementation to point at and a known failure mode to measure against
+(our delay/chunk ratio), rather than being our invention.
+
+### The framework-gap datapoint
+
+They report **PyTorch XPU at 294 ms** against their own OpenVINO at 172 ms on the
+same iGPU — a **1.71x framework gap**. Our equivalent on B60 is 294 vs 246 =
+**1.19x**. So our PyTorch path is already much closer to OV than theirs was,
+which sets expectations: we should not assume a 3.2x-style win is sitting in
+framework overhead. Consistent with F3 (no graph API to recover) and with the
+remaining gap being bytes (H) and dispatch (I, F5).
+
+### Net effect on our plan
+
+Nothing in the paper opens the iGPU — it closes it further, from their own
+measurements. What it does is **raise confidence in the two steps we already
+ranked first** (H bytes, I/F5 dispatch), supply a measured ~9 ms from F5 that we
+would not have looked for, and add one unsized candidate (SDPA broadcast fusion).
 
 ## Rules
 

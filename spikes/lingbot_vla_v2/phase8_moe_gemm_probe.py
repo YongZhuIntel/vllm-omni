@@ -53,12 +53,14 @@ print(f"{'M/expert':>9} {'ms/layer-step':>14} {'TFLOPS':>8} {'GFLOP':>7} {'x360 
 print("-" * 60)
 bench(51)  # discarded: absorbs first-call primitive setup, see module docstring
 rows = {}
-for m in (408, 204, 102, 51, 16, 8, 4, 2):
+for m in (408, 204, 102, 51, 26, 16, 13, 8, 4, 2):
     ms, tf, fl = bench(m)
     rows[m] = ms
     tag = "  <- dense (all 32 experts see all 51 tokens)" if m == 51 else ""
     if m == 8:
         tag = "  <- grouped top-4, capacity 8 (avg need 6.4)"
+    if m == 26:
+        tag = "  <- half the chunk, e.g. one side of a dGPU/iGPU split"
     print(f"{m:>9} {ms:>14.3f} {tf:>8.2f} {fl/1e9:>7.2f} {ms*INV:>15.1f}{tag}")
 
 print()
@@ -73,3 +75,11 @@ print()
 print(f"batching, per request: B=1 {rows[51]:.3f}  B=2 {rows[102]/2:.3f}  "
       f"B=4 {rows[204]/4:.3f}  B=8 {rows[408]/8:.3f} ms/layer-step")
 print(f"B=2 costs {rows[102]/rows[51]:.2f}x for 2x the tokens: memory-bound means batching is cheap")
+print()
+# The same flatness, read the other way, is why splitting the 50 action tokens
+# across two devices cannot work (G5): weight bytes do not depend on how many
+# rows read them, so half the rows is nowhere near half the time.
+slope = (rows[51] - rows[13]) / (51 - 13)
+print(f"half the chunk (M=26) costs {rows[26]/rows[51]*100:.0f}% of M=51, not 50%")
+print(f"extrapolated M->0 intercept: {rows[51] - slope*51:.3f} ms = "
+      f"{(rows[51] - slope*51)/rows[51]*100:.0f}% of the cost is token-count independent")
