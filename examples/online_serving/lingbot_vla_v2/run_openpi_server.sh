@@ -68,6 +68,10 @@ python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
     "${PREPARE_ARGS[@]}"
 export OMP_NUM_THREADS="$OMP_THREADS"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS (uncapped costs ~160 ms of served median here; see F6)"
+# --deploy-config carries policy_server_config into od_config.model_config, which
+# is where the OpenPI serving layer looks for it. Without it the WebSocket answers
+# "Robot policy not available". prepare (above) wrote this file next to the model.
 python -m vllm_omni.entrypoints.cli.main serve "$OUTPUT" \
     --omni --host 0.0.0.0 --port "$PORT" \
+    --deploy-config "$OUTPUT/deploy.yaml" \
     --dtype "$DTYPE" --enforce-eager --disable-log-stats

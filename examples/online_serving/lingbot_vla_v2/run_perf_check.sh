@@ -169,8 +169,12 @@ echo "prepared $OUTPUT  (moe_implementation=$MOE, num_steps=$STEPS, dtype=$DTYPE
 # -- serve --------------------------------------------------------------------
 echo
 echo "== serve =="
+# --deploy-config carries policy_server_config into od_config.model_config, which
+# is where the OpenPI serving layer looks for it. Without it the WebSocket answers
+# "Robot policy not available". prepare wrote this file next to the model.
 python -m vllm_omni.entrypoints.cli.main serve "$OUTPUT" \
     --omni --host 127.0.0.1 --port "$PORT" \
+    --deploy-config "$OUTPUT/deploy.yaml" \
     --dtype "$DTYPE" --enforce-eager --disable-log-stats >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 echo "server pid $SERVER_PID, log $SERVER_LOG"

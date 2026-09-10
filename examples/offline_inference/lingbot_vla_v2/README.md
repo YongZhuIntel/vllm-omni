@@ -627,6 +627,7 @@ cd /llm/zhuyong/lingbovla/my/vllm-omni &&
 PYTHONPATH=. python -m vllm_omni.entrypoints.cli.main serve \
   /tmp/lingbot-vla-v2-prepared \
   --omni --host 0.0.0.0 --port 8000 \
+  --deploy-config /tmp/lingbot-vla-v2-prepared/deploy.yaml \
   --dtype float16 --enforce-eager --disable-log-stats'
 ```
 

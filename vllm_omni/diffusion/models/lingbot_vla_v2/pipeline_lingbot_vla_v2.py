@@ -171,7 +171,11 @@ class LingbotVlaV2Pipeline(nn.Module):
         return DiffusionOutput(output={"actions": next(iter(robot_actions.values()))})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.transformer.load_weights(weights)
+        # The loader compares the returned names against this pipeline's own
+        # named_parameters(), so re-qualify the transformer-relative names it
+        # gets back. Without the prefix every parameter looks unloaded and the
+        # strict check in DiffusersPipelineLoader fails the whole load.
+        return {f"transformer.{name}" for name in self.transformer.load_weights(weights)}
 
 
 __all__ = ["LingbotVlaV2Pipeline"]

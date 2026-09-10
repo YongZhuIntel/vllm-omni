@@ -69,6 +69,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lingbot_vla_v2.pipeline import LINGBOT_VLA_V2_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -150,6 +151,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
     "hunyuan_video_15": HUNYUAN_VIDEO_15_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
+    "lingbot_vla_v2": LINGBOT_VLA_V2_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "dots_tts": DOTS_TTS_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
