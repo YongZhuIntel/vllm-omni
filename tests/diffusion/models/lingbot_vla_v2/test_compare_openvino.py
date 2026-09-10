@@ -66,6 +66,7 @@ def test_build_report_records_boundaries_and_ratios():
             "vllm_device": "xpu",
             "vllm_dtype": "float16",
             "compile_denoise_step": True,
+            "compile_prefix": True,
             "attention_backend": "eager",
             "attention_precision": "fp32",
         },
@@ -77,6 +78,7 @@ def test_build_report_records_boundaries_and_ratios():
     )
 
     assert report["settings"]["vllm_compiled"] is True
+    assert report["settings"]["compile_prefix"] is True
     assert report["milliseconds"]["openvino"]["total"] == 246.0
     assert report["vllm_over_openvino_ratio"]["denoise"] == pytest.approx(216 / 188)
     assert "one action IR call" in report["timing_boundaries"]["openvino"]

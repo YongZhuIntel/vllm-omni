@@ -136,6 +136,10 @@ def test_old_bundle_defaults_to_full_horizon(tmp_path):
 
 
 def test_episode_plot_uses_only_valid_steps(tmp_path):
+    # Plotting is behind the opt-in --plots flag, so matplotlib is not a
+    # declared dependency (write_episode_plots raises its own error without it).
+    pytest.importorskip("matplotlib", reason="matplotlib required for --plots output")
+
     ground_truth = np.zeros((1, 3, 14), dtype=np.float32)
     prediction = ground_truth.copy()
     prediction[:, 2] = 100.0
