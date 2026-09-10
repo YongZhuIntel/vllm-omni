@@ -196,6 +196,11 @@ _DIFFUSION_MODELS = {
         "pipeline_pi0",
         "Pi0Pipeline",
     ),
+    "LingbotVlaV2Pipeline": (
+        "lingbot_vla_v2",
+        "pipeline_lingbot_vla_v2",
+        "LingbotVlaV2Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -367,6 +372,10 @@ _NO_CACHE_ACCELERATION = {
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
+    # LingBot-VLA 2.0 has the same shape as π0: a self-contained sample_actions
+    # flow-matching loop, and its ``.transformer`` is an action-prediction head
+    # rather than a DiT block list.
+    "LingbotVlaV2Pipeline",
     "LingBotWorldCausalDMDPipeline",
 }
 

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+set -euo pipefail
+
+# Run the vLLM model-side latency probe and compare its result with the recorded
+# OpenVINO one-IR-call reference. This script never launches OpenVINO; it only
+# needs the vLLM-Omni runtime and the vLLM checkpoint.
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+CHECKPOINT="/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b"
+MODEL="/tmp/lingbot-vla-v2-perf"
+VLLM_DEVICE="xpu"
+VLLM_DTYPE="float16"
+ATTENTION_BACKEND="eager"
+ATTENTION_PRECISION="fp16"
+WARMUP="5"
+REPEAT="20"
+COMPILE_MAX_RELATIVE_ERROR="0.05"
+OUTPUT="/tmp/lingbot-openvino-comparison.json"
+COMPILE_DENOISE_STEP="1"
+COMPILE_PREFIX="0"
+PREPARE_MODEL="1"
+# Pinned, not inherited, so this script measures the same thing whatever the
+# caller's shell happens to export. F6 found that an uncapped intra-op pool
+# costs ~160 ms of *served* median on this hybrid CPU, but that finding does not
+# apply here and this is deliberately recorded rather than assumed: measured
+# 2026-09-09, this script reports total 294.3 ms uncapped and 294.2 ms at 4
+# threads. There is no asyncio loop or websocket thread competing in-process, so
+# the idle pool never takes the dispatch thread's core. The 294 ms reference
+# number in `PHASE8_LATENCY_PARITY.md` is therefore unaffected by the serving
+# fix, and the two scripts stay comparable to their own histories.
+OMP_THREADS="${OMP_NUM_THREADS:-4}"
+
+usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+Run vLLM latency and compare against the recorded OpenVINO reference timings.
+
+Options:
+  --checkpoint PATH     vLLM checkpoint directory (default: $CHECKPOINT)
+  --model PATH          Prepared model output directory (default: $MODEL)
+  --vllm-device D       vLLM device (default: $VLLM_DEVICE)
+  --dtype DTYPE         vLLM dtype (default: $VLLM_DTYPE)
+    --attention-backend D vLLM attention backend (default: $ATTENTION_BACKEND)
+    --attention-precision P attention precision: fp32 or fp16 (default: $ATTENTION_PRECISION)
+  --warmup N            vLLM warmup runs (default: $WARMUP)
+  --repeat N            vLLM timed runs (default: $REPEAT)
+    --compile-max-relative-error X  Compiled parity tripwire (default: $COMPILE_MAX_RELATIVE_ERROR)
+  --output PATH         JSON report path (default: $OUTPUT)
+  --eager               Use eager vLLM denoising instead of compiled denoising
+    --compile-prefix      Compile the fixed-shape Prefix walk with Inductor
+  --omp-threads N       Intra-op thread cap (default: $OMP_THREADS; measured neutral here)
+  --no-prepare          Reuse --model instead of preparing it from --checkpoint
+  -h, --help            Show this help
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --checkpoint) CHECKPOINT="$2"; shift 2 ;;
+        --model) MODEL="$2"; shift 2 ;;
+        --vllm-device) VLLM_DEVICE="$2"; shift 2 ;;
+        --dtype) VLLM_DTYPE="$2"; shift 2 ;;
+        --attention-backend) ATTENTION_BACKEND="$2"; shift 2 ;;
+        --attention-precision) ATTENTION_PRECISION="$2"; shift 2 ;;
+        --warmup) WARMUP="$2"; shift 2 ;;
+        --repeat) REPEAT="$2"; shift 2 ;;
+        --compile-max-relative-error) COMPILE_MAX_RELATIVE_ERROR="$2"; shift 2 ;;
+        --output) OUTPUT="$2"; shift 2 ;;
+        --eager) COMPILE_DENOISE_STEP="0"; shift ;;
+        --compile-prefix) COMPILE_PREFIX="1"; shift ;;
+        --omp-threads) OMP_THREADS="$2"; shift 2 ;;
+        --no-prepare) PREPARE_MODEL="0"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+for value in "$WARMUP" "$REPEAT"; do
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+        echo "warmup/repeat must be positive integers: $value" >&2
+        exit 2
+    }
+done
+
+cd "$REPO"
+export PYTHONPATH=.
+export OMP_NUM_THREADS="$OMP_THREADS"
+
+if [[ "$PREPARE_MODEL" == "1" ]]; then
+    [[ -d "$CHECKPOINT" ]] || { echo "vLLM checkpoint not found: $CHECKPOINT" >&2; exit 1; }
+    echo "== prepare vLLM model =="
+    rm -rf "$MODEL"
+    PREPARE_ARGS=(--checkpoint "$CHECKPOINT" --output "$MODEL")
+    if [[ "$COMPILE_DENOISE_STEP" == "0" ]]; then
+        PREPARE_ARGS+=(--no-compile-denoise-step)
+    fi
+    python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
+        "${PREPARE_ARGS[@]}"
+else
+    [[ -d "$MODEL" ]] || { echo "prepared vLLM model not found: $MODEL" >&2; exit 1; }
+fi
+
+COMPARE_ARGS=(
+    spikes/lingbot_vla_v2/compare_openvino.py
+    --vllm-only
+    --model "$MODEL"
+    --vllm-device "$VLLM_DEVICE"
+    --vllm-dtype "$VLLM_DTYPE"
+    --attention-backend "$ATTENTION_BACKEND"
+    --attention-precision "$ATTENTION_PRECISION"
+    --warmup "$WARMUP"
+    --repeat "$REPEAT"
+    --compile-max-relative-error "$COMPILE_MAX_RELATIVE_ERROR"
+    --output "$OUTPUT"
+)
+if [[ "$COMPILE_DENOISE_STEP" == "1" ]]; then
+    COMPARE_ARGS+=(--compile-denoise-step)
+fi
+if [[ "$COMPILE_PREFIX" == "1" ]]; then
+    COMPARE_ARGS+=(--compile-prefix)
+fi
+
+python "${COMPARE_ARGS[@]}"
