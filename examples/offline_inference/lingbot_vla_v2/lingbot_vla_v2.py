@@ -9,8 +9,14 @@ import time
 
 import numpy as np
 
-from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+try:
+    from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion as OmniEngine
+except ModuleNotFoundError as exc:
+    if exc.name != "vllm_omni.entrypoints.omni_diffusion":
+        raise
+    from vllm_omni.entrypoints.omni import Omni as OmniEngine
 
 
 def main(args: argparse.Namespace) -> None:
@@ -24,15 +30,18 @@ def main(args: argparse.Namespace) -> None:
         "state": np.zeros(14, dtype=np.float32),
         "prompt": args.prompt,
     }
-    engine = OmniDiffusion(model=args.model, dtype=args.dtype)
+    engine = OmniEngine(model=args.model, dtype=args.dtype)
     params = OmniDiffusionSamplingParams(
         seed=args.seed,
         extra_args={"robot_obs": robot_obs},
         save_output=False,
     )
-    started = time.perf_counter()
-    output = engine.generate(args.prompt, params)[0]
-    elapsed = time.perf_counter() - started
+    try:
+        started = time.perf_counter()
+        output = engine.generate(args.prompt, params)[0]
+        elapsed = time.perf_counter() - started
+    finally:
+        engine.close()
     actions = output.multimodal_output["actions"]
     print(f"type={output.final_output_type} shape={actions.shape} dtype={actions.dtype} elapsed={elapsed:.3f}s")
 

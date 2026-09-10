@@ -98,15 +98,12 @@ def cosine_per_sample(
     reference = ground_truth.astype(np.float32)
     candidate = prediction.astype(np.float32)
     if reference.ndim == 3:
-        lengths = (
-            valid_steps if valid_steps is not None else np.full(reference.shape[0], reference.shape[1])
-        )
+        lengths = valid_steps if valid_steps is not None else np.full(reference.shape[0], reference.shape[1])
         chunks = [(reference[i, :n].reshape(-1), candidate[i, :n].reshape(-1)) for i, n in enumerate(lengths)]
     else:
         chunks = [(reference.reshape(-1), candidate.reshape(-1))]
     cosines = [
-        float(np.dot(ref, out) / np.clip(np.linalg.norm(ref) * np.linalg.norm(out), 1e-12, None))
-        for ref, out in chunks
+        float(np.dot(ref, out) / np.clip(np.linalg.norm(ref) * np.linalg.norm(out), 1e-12, None)) for ref, out in chunks
     ]
     return np.asarray(cosines, dtype=np.float64)
 
@@ -223,8 +220,7 @@ def format_report(summary: dict[str, Any]) -> str:
         joint = fmt.format(micro[f"{key}_joint"]) if f"{key}_joint" in micro else "-"
         gripper = fmt.format(micro[f"{key}_gripper"]) if f"{key}_gripper" in micro else "-"
         lines.append(
-            f"  {label:<15} {fmt.format(micro[key]):>12} {joint:>12} {gripper:>12} "
-            f"{fmt.format(macro[key]):>13}"
+            f"  {label:<15} {fmt.format(micro[key]):>12} {joint:>12} {gripper:>12} {fmt.format(macro[key]):>13}"
         )
     lines += [
         "",
@@ -300,10 +296,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         print(json.dumps(summary, indent=2))
         return summary
 
-    from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    engine = OmniDiffusion(model=args.model, dtype=args.dtype)
+    try:
+        from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion as OmniEngine
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm_omni.entrypoints.omni_diffusion":
+            raise
+        from vllm_omni.entrypoints.omni import Omni as OmniEngine
+
+    engine = OmniEngine(model=args.model, dtype=args.dtype)
     predictions = []
     noise_seeds = []
     noise_hashes = []
