@@ -26,6 +26,7 @@ from vllm_omni.diffusion.models.lingbot_vla_v2 import (
     LingbotVlaV2ForActionPrediction,
 )
 from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (
+    denoise_compile_options,
     eager_attention,
     sdpa_attention,
     sdpa_attention_safe_padding,
@@ -41,6 +42,15 @@ BATCH = 1
 GRID = torch.tensor([[1, 4, 4]] * NUM_CAMS)
 PATCHES = int(GRID[0].prod())
 MASKED_LANG_TOKENS = 3
+
+
+@pytest.mark.parametrize(
+    ("torch_version", "expected"),
+    [("2.10.0+xpu", None), ("2.13.0+xpu", {"shape_padding": False})],
+)
+def test_denoise_compile_options_follow_torch_version(monkeypatch, torch_version, expected):
+    monkeypatch.setattr(torch, "__version__", torch_version)
+    assert denoise_compile_options() == expected
 
 
 def test_sdpa_attention_matches_eager_attention():

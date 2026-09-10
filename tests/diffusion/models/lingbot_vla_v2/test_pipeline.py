@@ -171,5 +171,10 @@ def test_pipeline_compiles_denoise_step_only_when_enabled(tmp_path):
         "backend": "inductor",
         "dynamic": False,
         "fullgraph": True,
+        **(
+            {"options": {"shape_padding": False}}
+            if tuple(map(int, torch.__version__.split("+", 1)[0].split(".")[:2])) >= (2, 13)
+            else {}
+        ),
     }
     assert pipeline.transformer.predict_velocity is compiled

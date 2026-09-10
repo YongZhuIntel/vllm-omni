@@ -18,6 +18,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.lingbot_vla_v2.config import LingbotVlaV2Config
 from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (
     LingbotVlaV2ForActionPrediction,
+    denoise_compile_options,
 )
 from vllm_omni.diffusion.models.lingbot_vla_v2.processor import (
     LingbotVlaV2Processor,
@@ -72,12 +73,11 @@ class LingbotVlaV2Pipeline(nn.Module):
                 fullgraph=True,
             )
         if self.config.compile_denoise_step:
-            self.transformer.predict_velocity = torch.compile(
-                self.transformer.predict_velocity,
-                backend="inductor",
-                dynamic=False,
-                fullgraph=True,
-            )
+            compile_kwargs = {"backend": "inductor", "dynamic": False, "fullgraph": True}
+            options = denoise_compile_options()
+            if options is not None:
+                compile_kwargs["options"] = options
+            self.transformer.predict_velocity = torch.compile(self.transformer.predict_velocity, **compile_kwargs)
         self.vae = None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(

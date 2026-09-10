@@ -97,6 +97,50 @@ Installing `cache-dit==1.2.0` also resolved or upgraded `hf-xet==1.6.0`,
 pre-existing `xgrammar` package expects Triton, which is not installed; this did
 not block LingBot model loading or inference.
 
+#### vLLM 0.28 XPU container
+
+The open-loop evaluator was also validated in
+`test-image_zy_v0.28.0_lingbot_omni`. No packages were installed or upgraded for
+this compatibility work; the image already contained:
+
+| Package | Version |
+| --- | --- |
+| PyTorch | `2.13.0+xpu` |
+| vLLM | `0.28.0+xpu` |
+| Transformers | `5.14.1` |
+| NumPy | `2.2.6` |
+| `cache-dit` | `1.5.0` |
+
+`vllm-omni` is not installed as package metadata in this image. The examples
+run directly from the checkout with `PYTHONPATH=.`; the shell runners set that
+automatically. Consequently, this development-mode warning is expected and does
+not affect inference:
+
+```text
+Failed to import version from _version.py ... Using fallback version 'dev'.
+```
+
+v0.28 removed `vllm_omni.entrypoints.omni_diffusion.OmniDiffusion`. The LingBot
+offline examples now fall back to `vllm_omni.entrypoints.omni.Omni`, while
+retaining compatibility with the old entrypoint. Both the single-request
+example and `run_open_loop_eval.sh --mode both` were validated without any
+additional installation.
+
+The v0.28 stack also changes compiled-denoise performance. Under identical
+`warmup=5`, `repeat=20`, fp16 settings, the old PyTorch 2.10/IPEX stack measured
+about `207.1 ms` for ten compiled denoise steps, while PyTorch 2.13 measured
+`224.4 ms`. Prefix stages became slightly faster, so the regression is isolated
+to the Inductor denoise graph rather than preprocessing or model code.
+
+For PyTorch 2.13 and newer, LingBot disables Inductor `shape_padding` only for
+the compiled denoise graph. Repeated measurements reduced denoise to about
+`221.3 ms` and total model time to about `306.8 ms`. Max autotuning regressed
+denoise to `236.1 ms`; disabling split/cat passes or epilogue fusion also did not
+help. Issue/drain profiling reports `176 ms` host issue plus `38 ms` device drain
+for the ten-step loop, so recovering the remaining gap requires an upstream
+Inductor/XPU lowering improvement or whole-loop XPU graph capture. The PyTorch
+2.10 path keeps its original compile options.
+
 ### Remaining work
 
 1. **Compiled-denoise gate — passed and defaulted.** Five fp16 noise seeds gave

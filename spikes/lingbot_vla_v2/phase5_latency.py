@@ -47,10 +47,8 @@ DEFAULT_PROMPT = "pick up the object"
 
 
 def _sync(device: torch.device) -> None:
-    if device.type == "xpu":
-        torch.xpu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize()
+    if device.type in ("xpu", "cuda"):
+        torch.accelerator.synchronize()
 
 
 class Stopwatch:
@@ -326,7 +324,9 @@ def compile_denoise_step(
     )
     _sync(device)
 
-    options = {}
+    from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import denoise_compile_options
+
+    options = denoise_compile_options() or {}
     if force_same_precision:
         options["force_same_precision"] = True
     if emulate_precision_casts:

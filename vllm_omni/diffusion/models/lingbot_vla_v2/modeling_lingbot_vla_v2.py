@@ -95,6 +95,13 @@ TIME_MIN_PERIOD = 4e-3
 TIME_MAX_PERIOD = 4.0
 
 
+def denoise_compile_options() -> dict[str, bool] | None:
+    """Disable the PyTorch 2.13 XPU shape-padding regression for this graph."""
+    version = torch.__version__.split("+", 1)[0].split(".")
+    major_minor = tuple(int(part) for part in version[:2])
+    return {"shape_padding": False} if major_minor >= (2, 13) else None
+
+
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
@@ -391,8 +398,11 @@ def flash_suffix_attention(
         raise RuntimeError("LingBot suffix FlashAttention requires cached Prefix keys and action tokens")
     valid_prefix = attention_mask[:, 0, :prefix_len]
     expected_state = torch.cat(
-        [valid_prefix, torch.ones((bsize, 1), dtype=torch.bool, device=query_states.device),
-         torch.zeros((bsize, suffix_len - 1), dtype=torch.bool, device=query_states.device)],
+        [
+            valid_prefix,
+            torch.ones((bsize, 1), dtype=torch.bool, device=query_states.device),
+            torch.zeros((bsize, suffix_len - 1), dtype=torch.bool, device=query_states.device),
+        ],
         dim=1,
     )
     expected_actions = torch.cat(
@@ -1116,9 +1126,7 @@ class LingbotJointModel(nn.Module):
                 value_states = torch.cat([cached_value, value_states], dim=1)
 
             attention_fn = eager_attention
-            if self.attention_backend == "sdpa" or (
-                self.attention_backend == "prefix_sdpa" and fill_kv_cache
-            ):
+            if self.attention_backend == "sdpa" or (self.attention_backend == "prefix_sdpa" and fill_kv_cache):
                 attention_fn = sdpa_attention
             elif self.attention_backend == "prefix_sdpa_safe" and fill_kv_cache:
                 attention_fn = sdpa_attention_safe_padding
@@ -1222,9 +1230,7 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
             future_video_share_future_depth_query=config.future_video_share_future_depth_query,
         )
 
-    def prefix_forward(
-        self, **kwargs
-    ) -> tuple[list[torch.Tensor | None], list[tuple[torch.Tensor, torch.Tensor]]]:
+    def prefix_forward(self, **kwargs) -> tuple[list[torch.Tensor | None], list[tuple[torch.Tensor, torch.Tensor]]]:
         """Run the Prefix transformer walk; kept separate for static compilation."""
         return self.qwenvl_with_expert.forward(**kwargs)
 

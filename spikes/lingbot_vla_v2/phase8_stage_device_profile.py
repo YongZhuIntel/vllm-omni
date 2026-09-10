@@ -44,19 +44,17 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
-
 from phase5_latency import DEFAULT_MODEL, build, observation
 
 
 def _sync(device: torch.device) -> None:
-    if device.type == "xpu":
-        torch.xpu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize()
+    if device.type in ("xpu", "cuda"):
+        torch.accelerator.synchronize()
 
 
 def measure(fn: Callable[[], Any], device: torch.device, repeats: int) -> dict[str, float]:
@@ -138,10 +136,16 @@ def profile(args: argparse.Namespace) -> int:
 
     compiled = not args.no_compile_denoise_step
     if compiled:
+        from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import denoise_compile_options
+
         # Exactly what `pipeline_lingbot_vla_v2.py:59` does in production.
         print("[compile] torch.compile(predict_velocity, inductor, dynamic=False, fullgraph=True)")
         model.predict_velocity = torch.compile(
-            model.predict_velocity, backend="inductor", dynamic=False, fullgraph=True
+            model.predict_velocity,
+            backend="inductor",
+            dynamic=False,
+            fullgraph=True,
+            options=denoise_compile_options(),
         )
 
     # Warm up through the full path: the first calls pay Inductor compilation and
