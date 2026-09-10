@@ -872,16 +872,46 @@ capture are different mechanisms, and only the second one addresses F1's
 diagnosis. That is also why the 3.6 GB package is not worth engineering around —
 even a lean export would not change the timing.
 
-**Verdict for step C.** The host tax cannot be recovered *by graph capture* from
-Python today. Doing that needs a C++/SYCL extension that binds
-`ext_oneapi_graph`, records the command list once and replays it — real work,
-against an extension that is still moving, for a ceiling that is smaller than it
-first looks: step C is the loop alone, whose host tax over the OV device floor is
-**~13 ms** (G2), and capturing every stage caps out at the whole ~40 ms. Step H
-is better ranked on both counts: larger (up to ~60 ms), and it needs no new
-runtime binding, with its first 30 ms changing no numerics. Revisit if a later
-`torch-xpu-ops` ships an `XPUGraph`; the check is one run of
-`phase8_graph_probe.py --skip-chain`.
+**Historical verdict for PyTorch 2.10.** The host tax could not be recovered by
+graph capture because the Python binding did not exist. That statement is no
+longer true on the v0.28 container's PyTorch `2.13.0+xpu`; see the retest below.
+
+### F3b. PyTorch 2.13 XPU Graph retest — real speedup, repeated replay unsafe
+
+PyTorch `2.13.0+xpu` exposes `torch.xpu.XPUGraph`, `torch.xpu.graph`, graph pool
+handles, and `make_graphed_callables`; vLLM reports `supports_xpu_graph()=True`.
+The API is functional, not a stub. A 60-kernel dispatch-bound chain reduced
+host issue time from `1.39 ms` to `0.30 ms` per iteration (`4.6x`).
+
+`phase8_xpu_graph_denoise_probe.py` then captured LingBot's complete ten-step
+loop. Capturing the already-compiled step measured:
+
+| path | ten-step denoise |
+|---|---:|
+| direct compiled loop | `210.1 ms` |
+| graph replay | `198.2 ms` |
+| static state/KV/noise copies | `0.33 ms` |
+| synchronized copies + replay | `198.6 ms` |
+
+This is a real `~5.5%` loop speedup, and the one-command model-side benchmark
+temporarily measured `202.5 ms` denoise / `287.6 ms` total versus about
+`221.3 ms` / `306.8 ms` without graph capture.
+
+It is not safe to deploy. Independent references initially appeared bit-exact,
+but the first probe references aliased Inductor's reusable output buffers. The
+five-seed gate exposed cross-replay state contamination: seed 0 was normal while
+later seeds diverged, producing mean MAE `5.388e-01`. Adding explicit stream
+synchronization did not fix it. Capturing the eager step avoids this corruption
+and passes ten alternating-request replays bit-exact, but costs `275.7 ms`, much
+slower than the direct compiled path.
+
+The model/config/CLI XPU Graph option was therefore removed. The standalone
+probe remains for upstream/runtime investigation. A deployable implementation
+needs Inductor graph buffers that are reset correctly between replays, or a
+graph capture of a stable lower-level step without Inductor's reusable internal
+buffers. Setting `VLLM_XPU_ENABLE_XPU_GRAPH=1` alone does not solve this for
+vLLM-Omni diffusion: vLLM's built-in capture path wraps its autoregressive GPU
+model runner, not LingBot's diffusion pipeline.
 
 But "no graph" is not the same as "no reachable host time" — F4 finds ~9 ms of
 the tax that is reachable from Python, by not submitting the work at all.

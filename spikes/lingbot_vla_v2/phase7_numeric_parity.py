@@ -76,6 +76,10 @@ for path in (str(HERE), str(REPO_ROOT)):
 import bootstrap  # noqa: E402
 from phase5_latency import build  # noqa: E402
 
+from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (  # noqa: E402
+    denoise_compile_options,
+)
+
 # The export repo's protocol constants, from ``make_reference_bundle.py`` and
 # ``wrappers.make_prefix_example``: 3 cameras of 224x224 uniform-random pixels
 # under generator seed 0, a fixed prompt, and a zero state.
@@ -150,12 +154,15 @@ def make_inputs(model: Any, processor: Any, protocol: str, seed: int) -> dict[st
     class _Shim:
         config = model.config
 
-    hf_processor = type(
-        "_P", (), {"tokenizer": processor.tokenizer, "image_processor": processor.image_processor}
-    )()
+    hf_processor = type("_P", (), {"tokenizer": processor.tokenizer, "image_processor": processor.image_processor})()
     images, img_masks, lang_tokens, lang_masks, image_grid_thw = wrappers.make_prefix_example(
-        _Shim(), hf_processor, num_cams=NUM_CAMS, size=IMAGE_SIZE, prompt=PROMPT,
-        dtype=torch.float32, seed=IMAGE_SEED,
+        _Shim(),
+        hf_processor,
+        num_cams=NUM_CAMS,
+        size=IMAGE_SIZE,
+        prompt=PROMPT,
+        dtype=torch.float32,
+        seed=IMAGE_SEED,
     )
     config = model.config
     state = torch.zeros(1, config.max_state_dim, dtype=torch.float32)
@@ -210,8 +217,9 @@ class ActivationAudit:
                 bad = int((~finite).sum())
                 if bad:
                     self.nonfinite[name] = self.nonfinite.get(name, 0) + bad
-                peak = float(tensor.where(finite, torch.zeros((), dtype=tensor.dtype,
-                                                              device=tensor.device)).abs().max())
+                peak = float(
+                    tensor.where(finite, torch.zeros((), dtype=tensor.dtype, device=tensor.device)).abs().max()
+                )
                 self.peaks[name] = max(self.peaks.get(name, 0.0), peak)
 
         return hook
@@ -224,8 +232,10 @@ class ActivationAudit:
     def report(self, top: int = 12) -> dict:
         ranked = sorted(self.peaks.items(), key=lambda kv: kv[1], reverse=True)[:top]
         worst = ranked[0][1] if ranked else 0.0
-        print(f"\n  activation audit -- fp16 ceiling {FP16_MAX:.0f}, "
-              f"observed peak {worst:.1f} ({FP16_MAX / max(worst, 1e-9):.1f}x headroom)")
+        print(
+            f"\n  activation audit -- fp16 ceiling {FP16_MAX:.0f}, "
+            f"observed peak {worst:.1f} ({FP16_MAX / max(worst, 1e-9):.1f}x headroom)"
+        )
         for name, peak in ranked:
             flag = "  <-- OVERFLOWS fp16" if peak >= FP16_MAX else ""
             print(f"    {peak:12.1f}  {name}{flag}")
@@ -250,9 +260,16 @@ def sample(model: Any, inputs: dict, device: torch.device, num_steps: int) -> np
 
 
 def run_config(
-    model_dir: Path, device: torch.device, dtype: torch.dtype, num_steps: int,
-    protocol: str, seeds: list[int], audit: bool, compiled: bool,
-    attention_precision: str = "fp32", compiled_prefix: bool = False,
+    model_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_steps: int,
+    protocol: str,
+    seeds: list[int],
+    audit: bool,
+    compiled: bool,
+    attention_precision: str = "fp32",
+    compiled_prefix: bool = False,
     attention_backend: str = "eager",
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
@@ -277,6 +294,7 @@ def run_config(
             backend="inductor",
             dynamic=False,
             fullgraph=True,
+            options=denoise_compile_options(),
         )
     # Only the first seed is audited: the hooks fire on every module of a 6B
     # model, and the peak magnitudes do not depend on the noise draw.
@@ -287,8 +305,9 @@ def run_config(
         inputs = cast_inputs(make_inputs(model, processor, protocol, seed), device, dtype)
         t0 = time.perf_counter()
         chunks[seed] = sample(model, inputs, device, num_steps)
-        print(f"[phase7] {device.type}:{str(dtype).split('.')[-1]} seed {seed} "
-              f"sampled in {time.perf_counter() - t0:.1f}s")
+        print(
+            f"[phase7] {device.type}:{str(dtype).split('.')[-1]} seed {seed} sampled in {time.perf_counter() - t0:.1f}s"
+        )
         if auditor is not None:
             auditor.close()
             audit_report = auditor.report()
@@ -338,21 +357,32 @@ def reference(args, model_dir: Path, seeds: list[int]) -> dict[int, np.ndarray]:
             and str(stored["checkpoint"]) == fingerprint
         )
         if same:
-            cached = {int(k.removeprefix("seed_")): stored[k]
-                      for k in stored.files if k.startswith("seed_")}
+            cached = {int(k.removeprefix("seed_")): stored[k] for k in stored.files if k.startswith("seed_")}
             print(f"[phase7] reference: {path} (cached seeds {sorted(cached)})")
         else:
-            print(f"[phase7] reference: {path} was built under a different protocol or "
-                  f"checkpoint -- rebuilding")
+            print(f"[phase7] reference: {path} was built under a different protocol or checkpoint -- rebuilding")
     missing = [s for s in seeds if s not in cached]
     if missing:
         print(f"[phase7] building the fp32 CPU reference for seeds {missing} (~25.5 GB RAM) ...")
-        fresh, _ = run_config(model_dir, torch.device("cpu"), torch.float32,
-                              args.num_steps, args.protocol, missing, audit=False, compiled=False)
+        fresh, _ = run_config(
+            model_dir,
+            torch.device("cpu"),
+            torch.float32,
+            args.num_steps,
+            args.protocol,
+            missing,
+            audit=False,
+            compiled=False,
+        )
         cached.update(fresh)
-        np.savez(path, num_steps=args.num_steps, protocol=args.protocol,
-                 model_dir=str(model_dir), checkpoint=fingerprint,
-                 **{f"seed_{s}": chunk for s, chunk in cached.items()})
+        np.savez(
+            path,
+            num_steps=args.num_steps,
+            protocol=args.protocol,
+            model_dir=str(model_dir),
+            checkpoint=fingerprint,
+            **{f"seed_{s}": chunk for s, chunk in cached.items()},
+        )
         print(f"[phase7] wrote {path}")
     return {s: cached[s] for s in seeds}
 
@@ -379,19 +409,19 @@ def aggregate(per_seed: list[dict]) -> dict:
 
 
 def print_table(rows: list[tuple[str, dict]]) -> None:
-    header = (f"{'path':<26} {'cosine':>10} {'MAE':>11} {'MSE':>11} "
-              f"{'max abs':>11} {'p99 abs':>11}  {'MAE range':>21}")
+    header = f"{'path':<26} {'cosine':>10} {'MAE':>11} {'MSE':>11} {'max abs':>11} {'p99 abs':>11}  {'MAE range':>21}"
     print("\n" + header)
     print("-" * len(header))
     for name, values in REFERENCE_ROWS.items():
         cos, mae, mse, mx, p99 = values
-        print(f"{name:<26} {cos:10.6f} {mae:11.3e} {mse:11.3e} {mx:11.3e} {p99:11.3e}"
-              f"  {'(1 noise draw)':>21}")
+        print(f"{name:<26} {cos:10.6f} {mae:11.3e} {mse:11.3e} {mx:11.3e} {p99:11.3e}  {'(1 noise draw)':>21}")
     print("-" * len(header))
     for name, m in rows:
         span = f"{m['mae_min']:.3e}-{m['mae_max']:.3e}"
-        print(f"{name:<26} {m['cosine_mean']:10.6f} {m['mae']:11.3e} {m['mse']:11.3e} "
-              f"{m['max_abs']:11.3e} {m['p99_abs']:11.3e}  {span:>21}")
+        print(
+            f"{name:<26} {m['cosine_mean']:10.6f} {m['mae']:11.3e} {m['mse']:11.3e} "
+            f"{m['max_abs']:11.3e} {m['p99_abs']:11.3e}  {span:>21}"
+        )
 
 
 def main() -> int:
@@ -402,12 +432,19 @@ def main() -> int:
     seeds = args.noise_seeds or [NOISE_PROTOCOLS[args.protocol]]
     ref = reference(args, model_dir, seeds)
     stacked = np.stack([ref[s] for s in seeds])
-    print(f"[phase7] reference {stacked.shape}  rms {np.sqrt((stacked.astype(np.float64) ** 2).mean()):.4f}  "
-          f"abs max {np.abs(stacked).max():.4f}  seeds {seeds}")
+    print(
+        f"[phase7] reference {stacked.shape}  rms {np.sqrt((stacked.astype(np.float64) ** 2).mean()):.4f}  "
+        f"abs max {np.abs(stacked).max():.4f}  seeds {seeds}"
+    )
 
     rows: list[tuple[str, dict]] = []
-    report: dict[str, Any] = {"protocol": args.protocol, "num_steps": args.num_steps,
-                              "model": str(model_dir), "seeds": seeds, "candidates": {}}
+    report: dict[str, Any] = {
+        "protocol": args.protocol,
+        "num_steps": args.num_steps,
+        "model": str(model_dir),
+        "seeds": seeds,
+        "candidates": {},
+    }
     for spec in args.candidates:
         parts = spec.split(":")
         if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "compiled"):
@@ -447,30 +484,52 @@ def main() -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="prepared vLLM-Omni model directory")
-    parser.add_argument("--candidates", nargs="+", default=["xpu:bfloat16", "xpu:float16"],
-                        help="device:dtype pairs, e.g. xpu:bfloat16 cpu:bfloat16")
+    parser.add_argument(
+        "--candidates",
+        nargs="+",
+        default=["xpu:bfloat16", "xpu:float16"],
+        help="device:dtype pairs, e.g. xpu:bfloat16 cpu:bfloat16",
+    )
     parser.add_argument("--num-steps", type=int, default=10)
-    parser.add_argument("--protocol", choices=sorted(NOISE_PROTOCOLS), default="export",
-                        help="noise seeding mechanism: 'export' matches make_reference_bundle.py")
-    parser.add_argument("--noise-seeds", type=int, nargs="+", default=None,
-                        help="noise draws to average over (default: the protocol's own seed). "
-                             "The observation is fixed; only the noise varies.")
+    parser.add_argument(
+        "--protocol",
+        choices=sorted(NOISE_PROTOCOLS),
+        default="export",
+        help="noise seeding mechanism: 'export' matches make_reference_bundle.py",
+    )
+    parser.add_argument(
+        "--noise-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="noise draws to average over (default: the protocol's own seed). "
+        "The observation is fixed; only the noise varies.",
+    )
     parser.add_argument("--reference", default=str(HERE / "phase7_golden_fp32.npz"))
     parser.add_argument("--refresh-reference", action="store_true")
-    parser.add_argument("--activation-audit", action="store_true",
-                        help="per-module peak |activation|; run it on a bf16 candidate")
-    parser.add_argument("--attention-precision", choices=("fp32", "fp16"), default="fp16",
-                        help="attention accumulation precision for candidates (default: fp16)")
-    parser.add_argument("--compile-prefix", action="store_true",
-                        help="compile the Prefix walk for each candidate")
+    parser.add_argument(
+        "--activation-audit", action="store_true", help="per-module peak |activation|; run it on a bf16 candidate"
+    )
+    parser.add_argument(
+        "--attention-precision",
+        choices=("fp32", "fp16"),
+        default="fp16",
+        help="attention accumulation precision for candidates (default: fp16)",
+    )
+    parser.add_argument("--compile-prefix", action="store_true", help="compile the Prefix walk for each candidate")
     parser.add_argument(
         "--attention-backend",
         choices=(
-            "eager", "sdpa", "prefix_sdpa", "suffix_sdpa", "ipex_prefix", "flash_prefix", "flash_prefix_gqa",
-            "flash_suffix"
+            "eager",
+            "sdpa",
+            "prefix_sdpa",
+            "suffix_sdpa",
+            "ipex_prefix",
+            "flash_prefix",
+            "flash_prefix_gqa",
+            "flash_suffix",
         ),
         default="eager",
         help="attention backend for candidates (default: eager)",

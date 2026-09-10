@@ -166,12 +166,10 @@ def eager_attention(
     value = value_states.transpose(1, 2)  # [B, H, Lk, D]
 
     att_weights = torch.matmul(query, key.transpose(-1, -2)) * (head_dim**-0.5)
-    mask_value = torch.tensor(
+    att_weights = att_weights.masked_fill(
+        ~attention_mask[:, None, :, :],
         torch.finfo(att_weights.dtype).min,
-        dtype=att_weights.dtype,
-        device=att_weights.device,
     )
-    att_weights = torch.where(attention_mask[:, None, :, :], att_weights, mask_value)
     probs = F.softmax(att_weights, dim=-1).to(value.dtype)
 
     att_output = torch.matmul(probs, value)  # [B, H, Lq, D]
