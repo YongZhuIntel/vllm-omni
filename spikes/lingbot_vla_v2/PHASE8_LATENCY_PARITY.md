@@ -100,6 +100,7 @@ Ordered by expected return. A is most of the gap; do not start C before A.
 | H | **Cut MoE weight bytes** — the loop is memory-bound at 51 FLOP/byte against a 207 machine balance | −30 ms to roofline, −30 more at int8 | not started; **the largest reachable item**, see F2 |
 | I | **Hoist loop-invariant work out of the 10 denoise steps** — γ/β FiLM projections, masks, position ids | −8 to −9 ms | not started; measured on the real model, no numerics change, see F4 |
 | J | **Merge `gate_proj` and `up_proj` into one weight** — 2 GEMMs instead of 3, routed and shared experts | −9 to −10 ms | not started; measured **bit-exact** (`max\|Δ\|=0`), stacks with I, see F5 and section J |
+| K | **Shrink the camera payload** — the whole of what is left of step E is the client sending 576 KiB of raw frames | −20 ms wall | not started; 224×224 instead of 256×256 is free (1.31x), JPEG with hardware decode on the iGPU is ~10x and needs an accuracy gate, see K1 |
 
 Step H displaced a grouped-MoE kernel, which F2 measured and rejected: the FLOP
 argument promises 6.38x and delivers 1.27x, because the MoE streams the same
@@ -1839,6 +1840,240 @@ Nothing in the paper opens the iGPU — it closes it further, from their own
 measurements. What it does is **raise confidence in the two steps we already
 ranked first** (H bytes, I/F5 dispatch), supply a measured ~9 ms from F5 that we
 would not have looked for, and add one unsized candidate (SDPA broadcast fusion).
+
+## K. Using the iGPU when it is a requirement, not an option — 2026-09-09
+
+G, G2, G4 and G5 answered *"should we put the iGPU in the request path?"* — no,
+four times, on four different grounds. This section answers a different question,
+which was asked next: **we have to use the iGPU; where can it go?** That is a
+fair question with a real answer, and getting to it needed three things the
+document did not have, all measured on this host today rather than borrowed from
+the vendor's OpenVINO logs.
+
+### 1. PyTorch cannot see both GPUs in one process
+
+`sycl-ls` sees both:
+
+```
+[level_zero:gpu][level_zero:0] ... Intel(R) Arc(TM) Pro B60 Graphics 20.1.0
+[level_zero:gpu][level_zero:1] ... Intel(R) Graphics 30.0.4
+```
+
+but `torch.xpu.device_count()` is **1**, and stays 1 under
+`ONEAPI_DEVICE_SELECTOR=level_zero:*`. The two GPUs report different Level Zero
+driver versions (20.1.0 vs 30.0.4), so they are separate SYCL platforms and
+torch-xpu 2.10.0 enumerates one of them. The iGPU *is* reachable, but only by
+selecting it exclusively:
+
+```
+ONEAPI_DEVICE_SELECTOR=level_zero:1 python -c "import torch; ..."
+  count 1
+  0 Intel(R) Graphics  56.40 GiB  eu 80  has_fp64 True
+```
+
+It then appears as `xpu:0`, with 56.40 GiB — which is shared host DRAM, not
+memory of its own — and 80 EUs against the B60's 160.
+
+**Consequence:** every dual-device design here is a *two-process* design, one
+`ONEAPI_DEVICE_SELECTOR` (or `ZE_AFFINITY_MASK`) per process, exactly like
+vLLM's iGPU-PP path in G. There is no in-process `.to("xpu:1")` shortcut, so the
+"cost to build" paragraph in G4 is the floor for anything in the model path.
+
+### 2. Our own `k`, and it is worse than the borrowed one
+
+G2 priced the split ceiling with `k` from the vendor's OpenVINO logs (4.81 vit /
+8.98 text / 9.29 loop). Running our own committed probes against the iGPU gives
+`k` on our stack, for the part of the model that F2 showed dominates:
+
+| probe | dGPU B60 | iGPU | k |
+|---|---:|---:|---:|
+| achievable read bandwidth (`phase8_bandwidth_probe.py`) | 449 GB/s | **29 GB/s** | **15.4x** |
+| MoE GEMM at M=51 (`phase8_moe_gemm_probe.py`) | 0.251 ms | **3.246 ms** | **12.9x** |
+| the same, x360 = denoise-loop projection | 90.4 ms | 1168.5 ms | |
+
+29 GB/s is the decisive one, because F2 established the loop is memory-bound on
+expert weights and the iGPU streams them from the same host DRAM the CPU uses.
+G2's ceiling for the loop therefore falls from `1/(1+9.29)` = 9.7% to
+`1/(1+12.9)` = **7.2%**, and the whole-request ceiling from ~10.5% to under 8%.
+Measuring our own hardware moved the number the wrong way.
+
+### 3. The concurrency budget — the useful result
+
+Every earlier estimate of dual-device *contention* was borrowed: OV paid ~21 ms
+for its ViT-prefetch arrangement, and G4 guessed ours would be worse "since we
+are host dispatch-bound". That guess is now a measurement. Four background loads,
+each run in its own process group on a verified-idle host, against
+`run_openvino_comparison.sh --no-prepare --repeat 20`:
+
+| background load | model path | Δ vs baseline |
+|---|---:|---:|
+| none | **293.7 / 294.0 ms** | — |
+| one busy CPU thread, no GPU at all (control) | 298.1 | +4.1 |
+| iGPU **saturated compute** — 2048² fp16 matmul loop, 24.0 MiB working set | **489.2 / 511.0** | **+200 (1.74x)** |
+| iGPU **saturated compute, 512²** — 1.5 MiB working set | 515.7 | +222 (1.76x) |
+| iGPU **saturated DRAM** — 2.72 GB reads at 29 GB/s, continuous | 304.8 | +10.8 |
+| iGPU **128² matmul loop** — EUs mostly idle between tiny kernels | **296.2** | **+2.5** |
+| iGPU **10 ms of compute per 320 ms request period** (~3% duty) | **294.2** | **+0.2** |
+
+Read the last three rows against the first three and the shape of the answer
+appears: a busy iGPU is not uniformly expensive. Keeping the EU array busy costs
+three quarters of the request again; touching it briefly, or keeping it busy only
+with kernels too short to fill it, costs nothing measurable. There is a
+**budget**, and it is denominated in sustained EU occupancy.
+
+#### What the penalty is not — five candidates, each ruled out by measurement
+
+This subsection is a correction. A first pass concluded the mechanism was
+package power sharing, on the strength of a pure-Python loop that slowed from
+80.6 to 102.0 ms under load. **That was an artifact**: the same loop re-measured
+five times on an idle host reads 101-106 ms unpinned and 113-121 ms pinned to
+P-core 0 — it lands on a different core class each run, exactly the hazard F6
+was about. Pinned to one core, idle vs iGPU-busy is 117 → 122 ms mean, **+4%**,
+not +26%. The claim did not survive its own re-measurement.
+
+What the penalty is not:
+
+| candidate | test | result |
+|---|---|---|
+| the dGPU itself slows | read bandwidth, 4096² matmul, MoE layer-step at the real shape, iGPU busy | **448 GB/s vs 449, 1.46 vs 1.46 ms, 0.249 vs 0.251 ms — untouched** |
+| kernel submission is serialised in the driver | 20k tiny dGPU kernels, unsynced | 5.19 vs 5.22 µs — **no change** |
+| package power / CPU frequency | RAPL, and a pinned CPU-frequency proxy | 128² costs **18.4 W and is free**; 2048² costs 22.4 W and is ruinous. Pinned proxy +4% |
+| LLC / working-set pollution | 24.0 MiB vs 1.5 MiB vs 0.1 MiB iGPU working sets | 24 MiB **511.0**, 1.5 MiB **515.7** — footprint is irrelevant |
+| CPU core placement (the F6 mechanism) | load pinned to the LPE island; victim pinned to P-cores | load off the P-cores still costs 464.3; victim pinned as well, 444.5 |
+| host DRAM bandwidth | iGPU streaming at 29 GB/s continuously | +10.8 ms (3.7%) |
+
+The one variable the penalty tracks is **how long the iGPU's kernels keep its EUs
+busy**. 128² kernels are too short to fill the device, so it idles between them
+and the request is unaffected at the same 100% host CPU and 18.4 W. 512² and
+2048² fill it, and the request pays ~1.75x — with no change in the dGPU's own
+throughput, no change in submission cost, and no sensitivity to footprint or to
+where either process's threads run.
+
+So the cost lands on the victim's *host* side, and it is not the host resources
+that were checked. The remaining candidate — unproven, and stated as a candidate
+— is the shared kernel-mode GPU driver: the request issues thousands of distinct
+kernels with per-step synchronisation, while the 20k-identical-kernel loop that
+showed no slowdown does neither. That distinction is what a proper test would
+have to separate next, e.g. with `ze_tracer` or `xpu-smi dump` on both devices.
+
+One consequence for section G either way: G attributes the vendor's data-parallel
+result — the iGPU replica dragging the dGPU from 246 to 336 ms, 37% slower — to
+"host memory bandwidth and PCIe". The DRAM row above costs 3.7%, so that
+explanation is wrong on this SoC even though the conclusion was right. Our own
+penalty for the same arrangement is larger, 1.74x.
+
+Pinning is worth one more note because it stacks the wrong way. With the load
+left free to take a P-core *and* the victim confined to P-cores 0-3, the request
+goes to **856.2 ms** — the iGPU penalty times F6's core-contention penalty. Do
+not pin the server without also pinning everything else.
+
+### The rule this gives us
+
+> **iGPU work is free when it does not keep the EU array busy — brief bursts, or
+> kernels short enough that the device idles between them. Sustained occupancy
+> costs the request ~1.75x, and no amount of pinning, thread capping or power
+> budgeting recovers it. Schedule iGPU work into the dGPU's idle time; never run
+> it concurrently with the request.**
+
+That rule, not a partition of the model, is what makes the iGPU usable here.
+
+### K1. The fixed-function media engine — the best available use
+
+The contention result is about the **EU array**. The iGPU also has media blocks
+that are separate silicon, and `vainfo` confirms they are live on this host
+(`iHD` driver 26.1.4, VA-API 1.23, `libvpl.so` present):
+
+- `VAProfileJPEGBaseline : VAEntrypointVLD` — hardware **JPEG decode**
+- `VAProfileJPEGBaseline : VAEntrypointEncPicture` — hardware JPEG encode
+- `VAProfileNone : VAEntrypointVideoProc` — VPP **scaling / colour conversion**
+- H.264 / VP8 / VP9 / AV1 encode and decode
+
+Two uses follow, and the first one closes the last item in step E.
+
+**(a) JPEG on the wire, decoded on the iGPU.** F6 left step E at ~23 ms, of which
+**22.85 ms is the client shipping 576 KiB of raw frames** (3 cameras × 256×256×3).
+JPEG at ~10:1 makes that ~60 KiB and the send ~2-3 ms. The decode then has to
+land somewhere, and the CPU is the resource F6 showed is scarce — so it lands on
+the VDBOX, which costs neither EU power nor a host thread. Expected **~-20 ms of
+served latency**, and it is the only remaining item in step E.
+Not free of obligations: JPEG is lossy, so it needs an `run_open_loop_eval.sh`
+gate against the fp32 reference, and if VPP does the resize then
+`_process_frame`'s "bit-identical to torchvision `Resize((side, side))`"
+(`processor.py:645-657`) stops being true and needs re-gating. Cheaper variant
+with none of that risk: have the client send at the 224×224 the model resizes to
+anyway, which cuts the payload 1.31x for free.
+
+**(b) Episode recording and telemetry.** H.264 encode of the camera streams for
+open-loop datasets and for operator video, on the media block, at zero CPU and
+zero EU cost. Uses the iGPU visibly and cannot touch the request.
+
+**What K1 is not:** an offload of preprocessing. That motivation does not survive
+measurement — the whole host-side, non-model part of the request is about 4 ms:
+
+```
+pre.state 0.4   pre.images 1.9   pre.language 0.3   h2d 0.8   post.d2h_unnormalize 0.5
+```
+
+Three 256×256 cameras cost 1.9 ms to resize, rescale and patchify on the CPU.
+There is nothing there to win.
+
+### K2. Auxiliary, lower-rate models — architecturally the right home
+
+Anything that is *not* in the 294 ms and runs at a lower rate than the action
+head belongs on the iGPU: a safety or collision monitor on the observation, an
+out-of-distribution / task-completion detector, a System-2 style planner at ~1 Hz
+against the action head's ~3 Hz. This is what Intel's paper means in section J by
+"only architectural advantages are achieved" — the second device buys capability,
+not latency.
+
+The budget above is the design constraint, and it is a scheduling constraint, not
+a sizing one. Once G3's chunk pipelining is in place the dGPU is busy 294 ms out
+of a ~1.6 s chunk period, so **~80% of wall time is a genuine idle window** — but
+the iGPU work has to be placed *inside* that window, not merely be small. Running
+it concurrently with the request costs ~1.75x; running it in the gap costs
+nothing. That is a real piece of engineering (a two-process design with the
+request boundary as the trigger) and it is the only iGPU work worth building
+machinery for.
+
+### K3. Offline evaluation as a second replica — rejected on our own numbers now
+
+G's closing paragraph left this open: data parallelism, one replica per device,
+for `open_loop_eval.py` where staleness is meaningless and samples/s is
+everything, with "the burden of proof on making 3.08 samples/s better". The
+numbers above discharge that burden negatively. An iGPU replica is a *saturating*
+EU load by construction, so it costs the dGPU replica ~1.75x — 294 → ~500 ms —
+while contributing its own ~1168 ms loop, i.e. well under 1 sample/s. The
+vendor's 4.06 → 3.08 samples/s is not an artifact of their stack; we can now
+derive it. Duty-cycling the iGPU to stay inside the budget removes the throughput
+it was supposed to add.
+
+Batching remains the better answer for offline evaluation: 1.16x at B=2 (F1) with
+one device, one process and no cross-device transfer.
+
+### K4. Anything inside the model path — closed, and harder than before
+
+G2 (10.5% ceiling, now under 8%), G4 (buys period, sells staleness) and G5 (the
+rows cannot be divided because the cost is weight bytes) all stand, and the three
+measurements in this section make each of them worse rather than better: `k` is
+12.9-15.4x rather than 9.29x, the split needs two processes, and any concurrent
+iGPU work taxes the request by ~1.75x — which is larger than the entire
+ceiling it was trying to win.
+
+### Summary
+
+| direction | uses the iGPU | effect on the request | status |
+|---|---|---|---|
+| K1a JPEG on the wire, hardware decode | media block | **~-20 ms served** | recommended; needs an accuracy gate |
+| K1b episode / telemetry video encode | media block | none | free, do it whenever wanted |
+| K2 auxiliary lower-rate models | EU array, scheduled into the idle window | none if scheduled, ~+220 ms if not | the real opportunity; needs G3 first |
+| K3 offline eval second replica | EU array, saturating | ~+220 ms on the other replica | rejected, our own numbers |
+| K4 split the model path | EU array, concurrent | ~+220 ms against a <8% ceiling | closed |
+
+Unmeasured, and worth measuring if K1 or K2 is pursued: whether the media blocks
+also spend package power at a rate that costs CPU frequency (the duty-cycle and 128² rows suggest
+that whatever the mechanism is, bursts and short kernels are safe); the iGPU's ViT `k`, still borrowed at 4.81;
+and whether a *scheduled* iGPU window really is as free as the 3%-duty row
+implies when the work is 200 ms long instead of 10 ms.
 
 ## Rules
 
