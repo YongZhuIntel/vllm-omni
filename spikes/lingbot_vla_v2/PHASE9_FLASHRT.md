@@ -3,11 +3,16 @@
 Asked on 2026-09-11: read `/llm/zhuyong/FlashRT` and say whether there is
 optimization space left, and if so plan it.
 
-Answer: **yes, roughly 35 ms of bit-exact work and another 40 ms behind accuracy
-gates**, which would take the model path from 286.5 ms to ~210 ms — past the
+Answer: **yes, roughly 27 ms of bit-exact work and another 40 ms behind accuracy
+gates**, which would take the model path from 286.5 ms to ~220 ms — past the
 246 ms OpenVINO reference. Two of FlashRT's mechanisms are already on our list
 (F4 FiLM hoist, F5 gate/up merge); three are new; and two of its headline
 choices are measurably *wrong* on this hardware.
+
+*Revised 2026-09-11 after P1 and P4 landed: the original figures were 35 ms and
+~210 ms. Both landed items came in at ~0.6x their micro-benchmark estimate, and
+the remaining estimates are haircut by the same factor. 8.3 ms of the 27 is now
+banked rather than predicted.*
 
 Everything below was measured on the B60 today, at the real shapes, under
 `torch.compile(dynamic=False)` — not read off FlashRT's CUDA numbers. The
@@ -46,17 +51,29 @@ fp16, real shapes, 200–300 iterations after warmup:
 |---|---:|---:|---:|
 | routed MoE (4 einsums: gate, up, down, combine) | 0.2492 | 89.7 | 44% |
 | joint attention incl. the KV `cat` | 0.1102 | 39.7 | 20% |
-| shared expert (3 GEMMs) | 0.0792 | 28.5 | 14% |
+| ~~shared expert (3 GEMMs)~~ | ~~0.0792~~ | ~~28.5~~ | **wrong shape — see below** |
 | expert q/k/v (3 GEMMs) | 0.0644 | 23.2 | 12% |
 | o_proj + AdaRMSNorm + router + residuals | ~0.042 | ~15 | 8% |
-| **sum** | **~0.545** | **~196** | |
 | measured loop (F1) | 0.5594 | **201.4** | |
 
-97% accounted for. F2's 90.4 ms for the MoE GEMMs reproduces exactly (89.7),
-which is the cross-check that makes the rest of this file usable: these micro
-numbers are in the same regime as the real loop, so savings derived from them
-are credible **as upper bounds** (F4's lesson — Inductor has often already
-paid part of the cost).
+F2's 90.4 ms for the MoE GEMMs reproduces exactly (89.7), which is the
+cross-check that makes the rest of this file usable: these micro numbers are in
+the same regime as the real loop, so savings derived from them are credible
+**as upper bounds** (F4's lesson — Inductor has often already paid part of the
+cost).
+
+**Correction, 2026-09-11 (found while starting P4).** The shared-expert row was
+measured at `expert_intermediate_size = 2752`. That is the wrong constant: the
+released RoboTwin checkpoint's `token_moe_layers` covers all 36 layers, so
+`ExpertMLP` is never instantiated and the only SwiGLU branch in the loop is the
+shared expert at `token_shared_intermediate_size = **704**` — 3.9x narrower.
+(Confirmed on the real model: `load_weights` reports `36 fused gate_up`, one per
+layer, all of them shared experts.) The row is therefore an overcharge of
+unknown size, the original "97% accounted for" claim is **withdrawn**, and the
+sum row is deleted rather than patched with a guess: isolated compiled micros at
+`[51,768]×[768,704]` are noise-dominated (§6, P4) and are not the instrument to
+re-derive it with. What survives is the ranking of the top two rows, which is
+what the plan is built on.
 
 The second row is the surprise. **Attention is 20% of the loop** and no phase
 has ever sized it.
@@ -66,8 +83,8 @@ has ever sized it.
 | FlashRT mechanism | where | our verdict |
 |---|---|---|
 | batched FiLM γ/β precompute (`precompute_expert_film`, one GEMM for all `[step, layer, slot]`) | `forward.py:440` | **adopt** — it is exactly step I / F4, already sized at −8–9 ms on the real model. FlashRT supplies the implementation shape: cache one stacked `[4·L·H, H]` weight, one batched GEMM over all 10 timesteps. |
-| merged `gate_up` weight | `prepare_expert_merged_weights`, `forward.py:131` | **adopt** — our F5. Re-measured under compile below; it holds at −5.8 ms for the shared expert. |
-| merged QKV projection | `compute_kqv_expert` | **adopt, new** — F5 only ever considered gate/up. −10.4 ms, bit-exact. |
+| merged `gate_up` weight | `prepare_expert_merged_weights`, `forward.py:131` | **adopted, landed** — our F5, at the shared expert's real 704 width: **−1.8 ms**, bit-exact. P4. |
+| merged QKV projection | `compute_kqv_expert` | **adopted, landed** — F5 only ever considered gate/up. **−6.5 ms**, bit-exact. P1. |
 | preallocated KV buffer, k/v written straight into the suffix slot (no per-step copy) | `forward.py:512-536` | **reject** — see §4. Real in eager, zero under Inductor. |
 | FP8 weights / NVFP4 `gate_up` with static calibration | `fp4_ops.py`, `calibration.py` | **adopt the idea, reject the format** — on B60 `_scaled_mm` fp8 is *slower* than fp16; `torch._int_mm` int8 is 1.6x faster. §4. |
 | maskless fused attention (zero the pad K/V rows, accept the softmax distortion) | `mask_kv_cache_pad_rows` | **replace with an exact version** — our mask is column-uniform, so the pads can be *compacted away* instead of approximated. §3. |
@@ -237,20 +254,21 @@ expert weights at fp16.
 Ordered by return per unit of risk. Every number is a compiled micro-measurement
 at the real shape, so **treat each as an upper bound until it is re-measured on
 the real model** — F4 found a 3x overstatement doing exactly this, §4 found two
-items whose sign flipped, and P1 (the first one landed) came in at 0.62x its
-estimate. Scale the unmeasured rows accordingly.
+items whose sign flipped, and both landed items came in at ~0.6x their estimate
+(P1 0.62x, P4 0.56x against the shape-corrected figure). Scale the unmeasured
+rows accordingly.
 
 | # | item | est. | numerics | where |
 |---|---|---:|---|---|
 | ~~P1~~ | Merge expert `q_proj`/`k_proj`/`v_proj` into one `[768, 6144]` GEMM, split the output | est. −10.4, **actual −6.5 ms** | **bit-exact, landed** | `ExpertAttention`, `compute_qkv:957`, `load_weights` |
 | **P2** | Compact the prefix KV to its valid columns once after `prefix_fill`; drop the prefix half of the denoise mask | **−10.9 ms** | exact | `sample_actions`, `predict_velocity:1633`; needs length bucketing for `dynamic=False` |
 | **P3** | Hoist γ/β FiLM + masks + position ids out of the loop (step I / F4, FlashRT's `precompute_expert_film` as the shape) | **−8 to −9 ms** | bit-comparable | `AdaRMSNorm:471`, `denoise_actions:1586` |
-| **P4** | Merge the shared expert's `gate_proj`/`up_proj` (F5) — use the plain `[gate‖up]` concat, **not** an interleaved layout (0.063 vs 0.119 ms) | **−5.8 ms** | bit-exact | `ExpertMLP`, `load_weights` |
-| | *subtotal, no accuracy risk* | **≈ −35 ms** | | → model path ~251 ms |
+| ~~P4~~ | Merge the shared expert's `gate_proj`/`up_proj` (F5) — plain `[gate‖up]` concat | est. −3.2, **actual −1.8 ms** | **bit-exact, landed** | `GatedExpertMLP`, `load_weights` |
+| | *subtotal, no accuracy risk* | **≈ −27 ms** (−8.3 banked, ~−19 estimated) | | → model path ~259 ms |
 | **P5** | Reformulate the routed MoE into two 2-D GEMMs (§5) | **−7.5 ms** | rel 4.5e-4, Phase 7 gate | `GroupedExperts.forward_dense:846` |
 | **P6** | Debug the `suffix_sdpa` model-level MAE, then ship SDPA (`enable_gqa=True`, no `repeat_interleave`) on the compacted mask | **−12 to −14 ms** on top of P2 | SDPA is *more* accurate than eager in isolation; the 1.5e-1 is a defect | `sdpa_attention:180`, the compiled-graph interaction |
 | **P7** | int8 W8A8 on the two routed GEMMs, with FlashRT's calibration contract as the blueprint | **−20 ms** on top of P5 | Phase 7 gate is the whole job | new quant path + `load_weights` |
-| | *subtotal, all gates passed* | **≈ −75 ms** | | → model path **~210 ms**, past OV's 246 |
+| | *subtotal, all gates passed* | **≈ −67 ms** | | → model path **~220 ms**, still past OV's 246 |
 
 Two follow-ons, unsized, worth doing only after the above:
 
@@ -279,7 +297,7 @@ targets, eager, per layer-step:
 | | eager before | eager after | Δ |
 |---|---:|---:|---:|
 | routed MoE | 0.2577 | 0.2492 | −0.0085 |
-| shared expert | 0.0544 | 0.0428 | −0.0116 |
+| shared expert (at the wrong 2752 width — see §1) | 0.0544 | 0.0428 | −0.0116 |
 | expert q/k/v | 0.0423 | 0.0181 | −0.0242 |
 | **sum** | **0.3544** | **0.3101** | **−0.0443 (−16 ms ×360)** |
 
@@ -311,7 +329,7 @@ toward compiled, which is the precondition step 2 depends on.
 
 ### Sequencing
 
-P1 → P4 → P3 → P2 first: all four are independent, none needs a new numeric
+~~P1 → P4~~ (both landed 2026-09-11) → P3 → P2 first: all four are independent, none needs a new numeric
 argument, and together they are the difference between 286.5 and ~251 ms. P2
 should land before P6 because it is what makes the mask cheap enough for the
 SDPA question to be worth asking.
@@ -414,7 +432,73 @@ samples again -- two 6B models do not fit in 23.9 GiB together).
 `--fuse-expert-qkv/--no-` added to `phase5_latency.py` and
 `phase7_numeric_parity.py` for the A/B.
 
-### Side finding: the recorded Phase 7 baseline is stale, 2026-09-11
+### P4 — merge the shared expert's gate/up — **landed 2026-09-11**
+
+Est. −3.2 ms, expected bit-exact. Delivered **−1.8 ms**, bit-exact.
+
+Two things had to be corrected before any code was written:
+
+1. **The §6 estimate was measured at the wrong width.** It used
+   `expert_intermediate_size = 2752`, but `token_moe_layers` covers all 36
+   layers, so `ExpertMLP` is never constructed and the branch that actually runs
+   is the shared expert at `token_shared_intermediate_size = 704`. See the §1
+   correction. `use_shared_expert_gate = False`, so there is no third projection
+   to fold in either.
+2. **The re-measurement at 704 was unusable.** The compiled micro reported
+   `[gate‖up]` merged (0.0815 ms) as *faster than the unmerged pair plus the
+   gate it does not have* and inconsistent across repeats — at `[51,768]×[768,704]`
+   the kernel is smaller than the measurement noise. So the estimate was anchored
+   on P1's real-model result instead: P1 removed 2 GEMMs per layer-step for
+   6.5 ms, i.e. ~9 µs per removed GEMM per 360 layer-steps; P4 removes 1.
+
+Implementation: `ExpertMLP` and `SharedExpertMLP` were byte-identical duplicate
+classes, so both now derive from a shared `GatedExpertMLP` carrying
+`fuse_gate_up()` and the branching `forward`. Nothing in the repo does an
+`isinstance` check on either name, so the re-parenting is inert. The fusion runs
+from `load_weights` behind `config.fuse_expert_gate_up`, the same seam and the
+same flag convention as P1.
+
+Latency, `phase5_latency.py --model /tmp/lingbot-vla-v2-perf --compile-denoise-step
+--compile-max-relative-error 0.05 --iters 10 --warmup 3 --fuse-expert-qkv`, arms
+interleaved over three repetitions on top of P1:
+
+| rep | denoise, split | denoise, fused |
+|---|---:|---:|
+| 1 | 216.8 | 215.7 |
+| 2 | 216.5 | 213.9 |
+| 3 | 215.7 | 214.7 |
+| **median** | **216.5** | **214.7** |
+
+−1.8 ms on the loop and −1.8 on the request (303.0 → 301.2 synced median), with
+the fused arm ahead in all three pairs. Per-step 21.5 → 21.3 ms. Small, and it is
+the honest size of one 768×704 GEMM out of ~10 GEMM-class ops per layer-step —
+the estimate was 1.8x high, the same direction as P1.
+
+Cumulative after P1+P4: denoise **223.3 → 214.7 ms**, request **309.1 → 301.2**.
+
+Numerics — exact:
+
+| check | result |
+|---|---|
+| tiny CPU model, `test_fused_expert_gate_up_is_bit_exact` | `torch.equal`, both subclasses |
+| tiny CPU model, `test_both_expert_fusions_compose` (P1+P4 together) | `torch.equal` |
+| 6B, xpu/bfloat16, 5 seeds, eager | `max|Δ| = 0` |
+| 6B, xpu/bfloat16, 5 seeds, Inductor | `max|Δ| = 0` |
+| Phase 7 five-seed gate, fused vs split | **every field byte-identical** |
+
+The tiny test config is the useful one here: `token_moe_layers = [1, 3]` out of 4
+layers, so it instantiates both `ExpertMLP` and `SharedExpertMLP` and covers the
+dense subclass that the released checkpoint never builds.
+
+`run_open_loop_eval.sh` **not** re-run, for the same reason as P1: the sampled
+chunk is bit-identical on both sides.
+
+`phase9_p1_qkv_fusion.py` was renamed `phase9_fusion_exactness.py` and given
+`--fusion {qkv,gate_up,both}` rather than copied. `--fuse-expert-gate-up/--no-`
+added to `phase5_latency.py`, `phase7_numeric_parity.py` and
+`prepare_lingbot_vla_v2.py`.
+
+### Side finding: the prepared checkpoint moves under the Phase 7 cache, 2026-09-11
 
 Running the gate rebuilt `phase7_golden_fp32.npz` instead of using it. That is
 the cache doing its job: it stores a `checkpoint` fingerprint of the resolved
@@ -423,21 +507,30 @@ were re-pointed at `global_step_50000/hf_ckpt` on 2026-09-10 — after the npz
 (and after `phase7_numeric_parity.json`, written 2026-09-07). Any phase-7 run
 today rebuilds it, with or without P1.
 
-So the committed `phase7_numeric_parity.json` was measured against a *different
-checkpoint* than the one currently prepared, and today's numbers against the
-current one are better across the board:
+**Resolved during P4, later the same day — the recorded baseline was right and
+the P1-run numbers were the anomaly.** By the P4 gate the links had been
+re-pointed once more, at 02:57 on 2026-09-11, this time back to the canonical
+`/llm/zhuyong/lingbovla/models/lingbot-vla-v2-6b/`. The reference rebuilt again,
+and the numbers came back to the committed json:
 
-| | recorded 2026-09-07 | today, current checkpoint |
-|---|---:|---:|
-| xpu:bfloat16 MAE | 6.159e-02 | **2.974e-02** |
-| xpu:float16 MAE | 1.949e-02 | **1.566e-02** |
-| OpenVINO FP16 (reference) | 1.608e-02 | 1.608e-02 |
+| | recorded 2026-09-07 | P1 run, `global_step_50000/hf_ckpt` | P4 run, canonical |
+|---|---:|---:|---:|
+| xpu:bfloat16 MAE | 6.159e-02 | 2.974e-02 | **6.115e-02** |
+| xpu:float16 MAE | 1.949e-02 | 1.566e-02 | **1.899e-02** |
+| OpenVINO FP16 (reference) | 1.608e-02 | 1.608e-02 | 1.608e-02 |
 
-fp16 now sits *below* the OpenVINO FP16 MAE rather than 21% above it. The json
-is left as the dated record it is; anything that quotes 1.949e-02 as "our fp16
-number" is quoting the old checkpoint. This has nothing to do with P1 — P1 is
-byte-identical on both sides — but it changes what the accuracy budget for P5/P7
-actually is, so it needs re-basing before those are gated.
+So `phase7_numeric_parity.json` is **not** stale: it describes the checkpoint we
+actually deploy, reproduced today to within the fp32 reference's own rebuild
+noise (~0.7% and ~2.6%). The middle column measured a training checkpoint that
+happened to be linked in for a few hours. The accuracy budget for P5/P7 stands
+as recorded — fp16 at 1.9e-02 against the 2.882e-02 ceiling — and does **not**
+need re-basing.
+
+The real lesson is about the harness, not the model: `checkpoint_fingerprint`
+resolves through the symlink, which is what caught this, but nothing pins *which*
+checkpoint a prepared `/tmp` dir points at. Re-check the link target before
+quoting any absolute Phase 7 number. A/B comparisons are unaffected — both arms
+of P1 and of P4 ran against the same reference and came back byte-identical.
 
 ## 8. What this does not change
 

@@ -26,6 +26,8 @@ from vllm_omni.diffusion.models.lingbot_vla_v2 import (
     LingbotVlaV2ForActionPrediction,
 )
 from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import (
+    ExpertMLP,
+    TokenMoeBlock,
     denoise_compile_options,
     eager_attention,
     sdpa_attention,
@@ -334,10 +336,11 @@ def test_load_weights_strips_prefix_and_drops_align_heads(model):
     the deliberate exclusion of the align heads (120.68 M parameters that are only
     executed during training)."""
     torch.manual_seed(2)
-    # The mirror is what is under test, so keep the q/k/v fusion (which rewrites
-    # the tree after the copy loop) out of it; it has its own test below.
+    # The mirror is what is under test, so keep the fusions (which rewrite the
+    # tree after the copy loop) out of it; they have their own tests below.
     config = _policy_config()
     config.fuse_expert_qkv = False
+    config.fuse_expert_gate_up = False
     target = LingbotVlaV2ForActionPrediction(config, vlm_config=_vlm_config()).eval()
 
     donor = {f"model.{name}": tensor for name, tensor in model.state_dict().items()}
@@ -352,12 +355,17 @@ def test_load_weights_strips_prefix_and_drops_align_heads(model):
         assert torch.equal(target.state_dict()[name], tensor), name
 
 
-def _loaded_policy(model, *, fuse: bool) -> LingbotVlaV2ForActionPrediction:
+def _loaded_policy(model, *, fuse: bool, what: str = "both") -> LingbotVlaV2ForActionPrediction:
     config = _policy_config()
-    config.fuse_expert_qkv = fuse
+    config.fuse_expert_qkv = fuse and what in ("both", "qkv")
+    config.fuse_expert_gate_up = fuse and what in ("both", "gate_up")
     target = LingbotVlaV2ForActionPrediction(config, vlm_config=_vlm_config()).eval()
     target.load_weights({f"model.{name}": t for name, t in model.state_dict().items()}.items())
     return target
+
+
+def _expert_layers(policy):
+    return policy.qwenvl_with_expert.qwen_expert.model.layers
 
 
 def test_fused_expert_qkv_is_bit_exact(model, observation):
@@ -371,10 +379,43 @@ def test_fused_expert_qkv_is_bit_exact(model, observation):
     split = _loaded_policy(model, fuse=False)
     fused = _loaded_policy(model, fuse=True)
 
-    layer = fused.qwenvl_with_expert.qwen_expert.model.layers[0].self_attn
+    layer = _expert_layers(fused)[0].self_attn
     assert layer.qkv_proj is not None
     assert not hasattr(layer, "q_proj")
-    assert split.qwenvl_with_expert.qwen_expert.model.layers[0].self_attn.qkv_proj is None
+    assert _expert_layers(split)[0].self_attn.qkv_proj is None
+
+    with torch.no_grad():
+        assert torch.equal(_sample(fused, observation), _sample(split, observation))
+
+
+def test_fused_expert_gate_up_is_bit_exact(model, observation):
+    """Folding SwiGLU's gate/up into one projection must not move a single bit.
+
+    Both halves are the same width, so a swapped split is shape-compatible and
+    would only show up as silently wrong actions -- ``silu`` is applied to
+    whichever half comes back first.
+    """
+    split = _loaded_policy(model, fuse=False)
+    fused = _loaded_policy(model, fuse=True, what="gate_up")
+
+    # ``token_moe_layers`` covers only some layers here, so this exercises both
+    # subclasses: the dense ExpertMLP and the MoE block's SharedExpertMLP.
+    dense, moe = _expert_layers(fused)[0].mlp, _expert_layers(fused)[1].mlp
+    assert isinstance(dense, ExpertMLP)
+    assert isinstance(moe, TokenMoeBlock)
+    for mlp in (dense, moe.shared_expert):
+        assert mlp.gate_up_proj is not None
+        assert not hasattr(mlp, "gate_proj")
+    assert _expert_layers(split)[0].mlp.gate_up_proj is None
+
+    with torch.no_grad():
+        assert torch.equal(_sample(fused, observation), _sample(split, observation))
+
+
+def test_both_expert_fusions_compose(model, observation):
+    """P1 and P4 rewrite disjoint modules, so enabling both is still bit-exact."""
+    split = _loaded_policy(model, fuse=False)
+    fused = _loaded_policy(model, fuse=True)
 
     with torch.no_grad():
         assert torch.equal(_sample(fused, observation), _sample(split, observation))

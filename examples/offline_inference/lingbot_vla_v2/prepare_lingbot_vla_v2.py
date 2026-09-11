@@ -72,6 +72,7 @@ def prepare(args: argparse.Namespace) -> Path:
     config.attention_precision = args.attention_precision
     config.attention_backend = args.attention_backend
     config.fuse_expert_qkv = args.fuse_expert_qkv
+    config.fuse_expert_gate_up = args.fuse_expert_gate_up
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
     norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
@@ -154,6 +155,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="fold the action expert's q/k/v into one GEMM at load time "
         "(default: enabled; pass --no-fuse-expert-qkv for the split path)",
+    )
+    parser.add_argument(
+        "--fuse-expert-gate-up",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="fold the action expert's SwiGLU gate/up into one GEMM at load time "
+        "(default: enabled; pass --no-fuse-expert-gate-up for the split path)",
     )
     parser.add_argument("--output", required=True)
     return parser.parse_args()

@@ -77,6 +77,7 @@ def build(
     num_steps: int | None,
     moe: str | None = None,
     fuse_expert_qkv: bool | None = None,
+    fuse_expert_gate_up: bool | None = None,
 ) -> tuple[Any, Any]:
     """Reproduce ``LingbotVlaV2Pipeline.__init__`` without the engine."""
     sys.path.insert(0, str(REPO_ROOT))
@@ -100,6 +101,8 @@ def build(
         config.moe_implementation = moe
     if fuse_expert_qkv is not None:
         config.fuse_expert_qkv = fuse_expert_qkv
+    if fuse_expert_gate_up is not None:
+        config.fuse_expert_gate_up = fuse_expert_gate_up
 
     def resolve(value: str) -> Path:
         path = Path(value)
@@ -414,6 +417,12 @@ def main() -> int:
         help="override the config's expert q/k/v fusion (Phase 9 P1)",
     )
     parser.add_argument(
+        "--fuse-expert-gate-up",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the config's expert SwiGLU gate/up fusion (Phase 9 P4)",
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=(
             "eager",
@@ -475,7 +484,7 @@ def main() -> int:
 
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    processor, model = build(Path(args.model), device, dtype, args.num_steps, args.moe, args.fuse_expert_qkv)
+    processor, model = build(Path(args.model), device, dtype, args.num_steps, args.moe, args.fuse_expert_qkv, args.fuse_expert_gate_up)
     model.qwenvl_with_expert.attention_backend = args.attention_backend
     print(f"[attention] backend={args.attention_backend}")
     model.qwenvl_with_expert.attention_precision = args.attention_precision

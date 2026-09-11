@@ -176,6 +176,10 @@ class LingbotVlaV2Config:
     # it is expected to be bit-exact; keep the split path for parity diagnosis
     # through --no-fuse-expert-qkv.
     fuse_expert_qkv: bool = True
+    # Same rewrite on the expert's SwiGLU branches. The released checkpoint runs
+    # token-MoE on all 36 layers, so in practice this is the shared expert's
+    # 768x704 gate/up pair; one fewer dispatch per layer-step, bit-exact.
+    fuse_expert_gate_up: bool = True
 
     def __post_init__(self) -> None:
         resolution = self.image_resolution

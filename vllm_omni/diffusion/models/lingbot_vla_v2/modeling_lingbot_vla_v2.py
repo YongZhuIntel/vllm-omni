@@ -788,30 +788,50 @@ class ExpertAttention(nn.Module):
         del self.q_proj, self.k_proj, self.v_proj
 
 
-class ExpertMLP(nn.Module):
-    """Dense SwiGLU MLP, for expert layers that are not token-MoE."""
+class GatedExpertMLP(nn.Module):
+    """SwiGLU: ``down(silu(gate(x)) * up(x))``, with the gate/up merge.
+
+    Base for the expert's two SwiGLU branches, which differ only in what the
+    checkpoint calls them and how wide they are.
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
+        self.intermediate_size = intermediate_size
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        # Set by fuse_gate_up() after the checkpoint is in; see ExpertAttention.
+        self.gate_up_proj: nn.Linear | None = None
+
+    def fuse_gate_up(self) -> None:
+        """Replace gate/up with one Linear, concatenated along dim 0."""
+        if self.gate_up_proj is not None:
+            return
+        gate, up = self.gate_proj, self.up_proj
+        fused = nn.Linear(gate.in_features, 2 * self.intermediate_size, bias=False, device="meta")
+        fused.weight = nn.Parameter(torch.cat([gate.weight, up.weight], dim=0))
+        self.gate_up_proj = fused
+        del self.gate_proj, self.up_proj
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.gate_up_proj is not None:
+            gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(F.silu(gate) * up)
 
 
-class SharedExpertMLP(nn.Module):
+class ExpertMLP(GatedExpertMLP):
+    """Dense SwiGLU MLP, for expert layers that are not token-MoE.
+
+    Unused by the released RoboTwin checkpoint, whose ``token_moe_layers`` covers
+    all 36 layers.
+    """
+
+
+class SharedExpertMLP(GatedExpertMLP):
     """Always-on SwiGLU branch added to every token's MoE output."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class GroupedExperts(nn.Module):
@@ -1724,15 +1744,15 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
                 f"{len(skipped)} unexpected key(s) (first 5: {skipped[:5]}); "
                 f"{len(missing)} missing parameter(s) (first 5: {missing[:5]})."
             )
-        fused_layers = 0
-        if self.config.fuse_expert_qkv:
-            fused_layers = self.fuse_expert_qkv()
+        fused_qkv = self.fuse_expert_qkv() if self.config.fuse_expert_qkv else 0
+        fused_gate_up = self.fuse_expert_gate_up() if self.config.fuse_expert_gate_up else 0
         logger.info(
             "LingBot-VLA 2.0 load_weights: %d tensors loaded, 0 missing, %d dead align-head tensors dropped, "
-            "%d expert layer(s) with fused qkv.",
+            "%d fused qkv, %d fused gate_up.",
             len(loaded),
             len(dead),
-            fused_layers,
+            fused_qkv,
+            fused_gate_up,
         )
         # The checkpoint names are what the loader checks against the snapshot it
         # took before this call, so report them even where the tree no longer has
@@ -1749,6 +1769,18 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
         for module in self.modules():
             if isinstance(module, ExpertAttention):
                 module.fuse_qkv()
+                count += 1
+        return count
+
+    def fuse_expert_gate_up(self) -> int:
+        """Fold every action-expert SwiGLU branch's gate/up into one projection.
+
+        The VLM tower's MLPs are ``Qwen3VLMLP``, not ours, so they are untouched.
+        """
+        count = 0
+        for module in self.modules():
+            if isinstance(module, GatedExpertMLP):
+                module.fuse_gate_up()
                 count += 1
         return count
 

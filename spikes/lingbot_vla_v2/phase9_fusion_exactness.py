@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Is folding the expert's q/k/v into one GEMM bit-exact on the 6B checkpoint?
+"""Are the expert's weight merges bit-exact on the 6B checkpoint?
 
-Phase 9 P1 concatenates ``q_proj``/``k_proj``/``v_proj`` along dim 0 and splits
-the product back apart. That is the same arithmetic per output element, so the
-action chunk should not move by one bit -- but "should" is how a misaligned
-split ships silently, because the wrong slice still has the right shape whenever
-the kv-head count divides the query-head count.
+Phase 9 P1 concatenates ``q_proj``/``k_proj``/``v_proj`` along dim 0 and P4 does
+the same to SwiGLU's ``gate_proj``/``up_proj``, splitting the product back apart
+in both cases. That is the same arithmetic per output element, so the action
+chunk should not move by one bit -- but "should" is how a misaligned split ships
+silently: the wrong slice still has the right shape whenever the kv-head count
+divides the query-head count (P1), and gate/up are the same width outright (P4),
+so nothing but the numbers would complain.
 
 The check has to happen inside one process on one set of weights: two 6B models
 do not fit in 23.9 GiB together, and comparing across processes would confound
 the fusion with load order. So: load unfused, sample, fuse in place, sample
 again, compare.
 
-    PYTHONPATH=. python spikes/lingbot_vla_v2/phase9_p1_qkv_fusion.py \
-        --model /tmp/lingbot-vla-v2-perf
+    PYTHONPATH=. python spikes/lingbot_vla_v2/phase9_fusion_exactness.py \
+        --model /tmp/lingbot-vla-v2-perf --fusion gate_up
 """
 
 from __future__ import annotations
@@ -44,6 +46,12 @@ def main() -> int:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument(
+        "--fusion",
+        choices=("qkv", "gate_up", "both"),
+        default="both",
+        help="which merge to apply between the two sample passes (P1, P4, or both at once)",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="run both sides through Inductor, which is the deployment default. The "
@@ -55,10 +63,15 @@ def main() -> int:
 
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    processor, model = build(Path(args.model), device, dtype, None, None, fuse_expert_qkv=False)
+    processor, model = build(
+        Path(args.model), device, dtype, None, None, fuse_expert_qkv=False, fuse_expert_gate_up=False
+    )
 
-    attn = model.qwenvl_with_expert.qwen_expert.model.layers[0].self_attn
-    assert attn.qkv_proj is None, "build() was asked for the split path and did not deliver it"
+    layer = model.qwenvl_with_expert.qwen_expert.model.layers[0]
+    mlp = layer.mlp.shared_expert if hasattr(layer.mlp, "shared_expert") else layer.mlp
+    assert layer.self_attn.qkv_proj is None and mlp.gate_up_proj is None, (
+        "build() was asked for the split path and did not deliver it"
+    )
 
     obs = [observation(processor.spec, seed) for seed in args.seeds]
     noise = [
@@ -76,9 +89,12 @@ def main() -> int:
         )
     split = [chunk(processor, model, o, device, dtype, n) for o, n in zip(obs, noise)]
 
-    fused_layers = model.fuse_expert_qkv()
-    print(f"[p1] fused {fused_layers} expert layers in place")
-    assert attn.qkv_proj is not None
+    if args.fusion in ("qkv", "both"):
+        print(f"[p1] fused {model.fuse_expert_qkv()} expert attentions in place")
+        assert layer.self_attn.qkv_proj is not None
+    if args.fusion in ("gate_up", "both"):
+        print(f"[p4] fused {model.fuse_expert_gate_up()} expert SwiGLU branches in place")
+        assert mlp.gate_up_proj is not None
     if args.compile:
         torch._dynamo.reset()
         model.predict_velocity = torch.compile(
@@ -90,9 +106,9 @@ def main() -> int:
         after = chunk(processor, model, o, device, dtype, n)
         delta = (after - before).abs().max().item()
         worst = max(worst, delta)
-        print(f"[p1] seed {seed}: max|delta| = {delta:.3e}  {'EXACT' if delta == 0.0 else 'MOVED'}")
+        print(f"[{args.fusion}] seed {seed}: max|delta| = {delta:.3e}  {'EXACT' if delta == 0.0 else 'MOVED'}")
 
-    print(f"[p1] worst over {len(args.seeds)} seeds: {worst:.3e}")
+    print(f"[{args.fusion}] worst over {len(args.seeds)} seeds: {worst:.3e}")
     return 0 if worst == 0.0 else 1
 
 
