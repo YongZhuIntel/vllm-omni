@@ -765,6 +765,27 @@ class ExpertAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=True)
         self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        # Set by fuse_qkv() after the checkpoint is in. Constructing the split
+        # form first is deliberate: load_weights stays a plain name mirror.
+        self.qkv_proj: nn.Linear | None = None
+        self.qkv_split = (num_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim)
+
+    def fuse_qkv(self) -> None:
+        """Replace the three q/k/v Linears with one, concatenated along dim 0.
+
+        Pure rewrite of the same weights, so ``qkv_proj(x).split(qkv_split)`` is
+        the three original products -- what changes is that the denoise loop
+        dispatches one GEMM per layer-step instead of three on 51 tokens, where
+        the projections are dispatch-bound rather than compute-bound.
+        """
+        if self.qkv_proj is not None:
+            return
+        q, k, v = self.q_proj, self.k_proj, self.v_proj
+        fused = nn.Linear(q.in_features, sum(self.qkv_split), bias=True, device="meta")
+        fused.weight = nn.Parameter(torch.cat([q.weight, k.weight, v.weight], dim=0))
+        fused.bias = nn.Parameter(torch.cat([q.bias, k.bias, v.bias], dim=0))
+        self.qkv_proj = fused
+        del self.q_proj, self.k_proj, self.v_proj
 
 
 class ExpertMLP(nn.Module):
@@ -957,15 +978,20 @@ class ExpertDecoderLayer(nn.Module):
     def compute_qkv(
         self, hidden_states: torch.Tensor, ada_cond: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        param_dtype = self.self_attn.q_proj.weight.dtype
+        attn = self.self_attn
+        fused = attn.qkv_proj
+        param_dtype = (fused if fused is not None else attn.q_proj).weight.dtype
         hidden_states = hidden_states.to(param_dtype)
         if ada_cond is not None:
             ada_cond = ada_cond.to(param_dtype)
         hidden_states = self._norm(self.input_layernorm, hidden_states, ada_cond)
-        shape = (*hidden_states.shape[:-1], -1, self.self_attn.head_dim)
-        query = self.self_attn.q_proj(hidden_states).view(shape)
-        key = self.self_attn.k_proj(hidden_states).view(shape)
-        value = self.self_attn.v_proj(hidden_states).view(shape)
+        shape = (*hidden_states.shape[:-1], -1, attn.head_dim)
+        if fused is not None:
+            query, key, value = fused(hidden_states).split(attn.qkv_split, dim=-1)
+            return query.view(shape), key.view(shape), value.view(shape)
+        query = attn.q_proj(hidden_states).view(shape)
+        key = attn.k_proj(hidden_states).view(shape)
+        value = attn.v_proj(hidden_states).view(shape)
         return query, key, value
 
     def apply_attention(
@@ -1698,12 +1724,33 @@ class LingbotVlaV2ForActionPrediction(nn.Module):
                 f"{len(skipped)} unexpected key(s) (first 5: {skipped[:5]}); "
                 f"{len(missing)} missing parameter(s) (first 5: {missing[:5]})."
             )
+        fused_layers = 0
+        if self.config.fuse_expert_qkv:
+            fused_layers = self.fuse_expert_qkv()
         logger.info(
-            "LingBot-VLA 2.0 load_weights: %d tensors loaded, 0 missing, %d dead align-head tensors dropped.",
+            "LingBot-VLA 2.0 load_weights: %d tensors loaded, 0 missing, %d dead align-head tensors dropped, "
+            "%d expert layer(s) with fused qkv.",
             len(loaded),
             len(dead),
+            fused_layers,
         )
+        # The checkpoint names are what the loader checks against the snapshot it
+        # took before this call, so report them even where the tree no longer has
+        # a q_proj to match (see diffusers_loader.load_weights).
         return loaded
+
+    def fuse_expert_qkv(self) -> int:
+        """Fold every action-expert layer's q/k/v into one projection.
+
+        Called at the end of ``load_weights`` because the fusion reads loaded
+        tensors. Returns the number of layers rewritten.
+        """
+        count = 0
+        for module in self.modules():
+            if isinstance(module, ExpertAttention):
+                module.fuse_qkv()
+                count += 1
+        return count
 
 
 __all__ = [

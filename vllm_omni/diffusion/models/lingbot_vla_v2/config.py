@@ -169,6 +169,13 @@ class LingbotVlaV2Config:
     # Full Prefix graph compile is experimentally measured at ~41 ms versus
     # ~58 ms eager on B60, but its accuracy gate is still pending.
     compile_prefix: bool = False
+    # Fold the action expert's q/k/v projections into one GEMM at load time. The
+    # denoise loop runs them 360 times on 51 tokens, where three small GEMMs are
+    # dispatch-bound: Phase 9 measures 0.0644 -> 0.0355 ms per layer-step
+    # compiled (~-10 ms per request). The rewrite only concatenates weights, so
+    # it is expected to be bit-exact; keep the split path for parity diagnosis
+    # through --no-fuse-expert-qkv.
+    fuse_expert_qkv: bool = True
 
     def __post_init__(self) -> None:
         resolution = self.image_resolution

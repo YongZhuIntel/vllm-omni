@@ -334,7 +334,11 @@ def test_load_weights_strips_prefix_and_drops_align_heads(model):
     the deliberate exclusion of the align heads (120.68 M parameters that are only
     executed during training)."""
     torch.manual_seed(2)
-    target = LingbotVlaV2ForActionPrediction(_policy_config(), vlm_config=_vlm_config()).eval()
+    # The mirror is what is under test, so keep the q/k/v fusion (which rewrites
+    # the tree after the copy loop) out of it; it has its own test below.
+    config = _policy_config()
+    config.fuse_expert_qkv = False
+    target = LingbotVlaV2ForActionPrediction(config, vlm_config=_vlm_config()).eval()
 
     donor = {f"model.{name}": tensor for name, tensor in model.state_dict().items()}
     donor["model.depth_align_head.projector.proj_in1.weight"] = torch.zeros(4, 4)
@@ -346,6 +350,41 @@ def test_load_weights_strips_prefix_and_drops_align_heads(model):
     assert "state_proj.weight" in loaded
     for name, tensor in model.state_dict().items():
         assert torch.equal(target.state_dict()[name], tensor), name
+
+
+def _loaded_policy(model, *, fuse: bool) -> LingbotVlaV2ForActionPrediction:
+    config = _policy_config()
+    config.fuse_expert_qkv = fuse
+    target = LingbotVlaV2ForActionPrediction(config, vlm_config=_vlm_config()).eval()
+    target.load_weights({f"model.{name}": t for name, t in model.state_dict().items()}.items())
+    return target
+
+
+def test_fused_expert_qkv_is_bit_exact(model, observation):
+    """Folding q/k/v into one projection must not move a single bit.
+
+    It concatenates the same weights along dim 0, so the only way the sampled
+    action can move is if the split back into q/k/v is misaligned -- which is
+    silent, because the wrong slice still has the right shape whenever the
+    kv-head count divides the query-head count.
+    """
+    split = _loaded_policy(model, fuse=False)
+    fused = _loaded_policy(model, fuse=True)
+
+    layer = fused.qwenvl_with_expert.qwen_expert.model.layers[0].self_attn
+    assert layer.qkv_proj is not None
+    assert not hasattr(layer, "q_proj")
+    assert split.qwenvl_with_expert.qwen_expert.model.layers[0].self_attn.qkv_proj is None
+
+    with torch.no_grad():
+        assert torch.equal(_sample(fused, observation), _sample(split, observation))
+
+
+def test_fused_expert_qkv_leaves_the_vlm_tower_alone(model):
+    """P8, not P1: the VLM tower's q/k norms sit between projection and view."""
+    fused = _loaded_policy(model, fuse=True)
+    vlm_layer = fused.qwenvl_with_expert.qwenvl.model.language_model.layers[0].self_attn
+    assert hasattr(vlm_layer, "q_proj")
 
 
 @pytest.mark.parametrize("defect", ["missing", "unexpected"])

@@ -71,6 +71,7 @@ def prepare(args: argparse.Namespace) -> Path:
     config.compile_prefix = args.compile_prefix
     config.attention_precision = args.attention_precision
     config.attention_backend = args.attention_backend
+    config.fuse_expert_qkv = args.fuse_expert_qkv
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
     norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
@@ -146,6 +147,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="compile the fixed-shape Prefix walk with Inductor (default: disabled)",
+    )
+    parser.add_argument(
+        "--fuse-expert-qkv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="fold the action expert's q/k/v into one GEMM at load time "
+        "(default: enabled; pass --no-fuse-expert-qkv for the split path)",
     )
     parser.add_argument("--output", required=True)
     return parser.parse_args()

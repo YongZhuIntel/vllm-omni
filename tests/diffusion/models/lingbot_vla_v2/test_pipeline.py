@@ -155,7 +155,9 @@ def test_forward_synthesizes_warmup_observation(tmp_path):
 def test_load_weights_delegates_to_policy(tmp_path):
     pipeline = _pipeline(tmp_path)
     loaded = pipeline.load_weights([("weight", torch.ones(1))])
-    assert loaded == {"weight"}
+    # Re-qualified against the pipeline's own named_parameters(), which is what
+    # DiffusersPipelineLoader compares the returned set against.
+    assert loaded == {"transformer.weight"}
 
 
 def test_pipeline_compiles_denoise_step_only_when_enabled(tmp_path):

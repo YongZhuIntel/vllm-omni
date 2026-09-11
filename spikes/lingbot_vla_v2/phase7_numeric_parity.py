@@ -271,6 +271,7 @@ def run_config(
     attention_precision: str = "fp32",
     compiled_prefix: bool = False,
     attention_backend: str = "eager",
+    fuse_expert_qkv: bool | None = None,
 ) -> tuple[dict[int, np.ndarray], dict | None]:
     """Build once, sample every noise seed, tear down.
 
@@ -278,7 +279,7 @@ def run_config(
     are never resident together, and so N seeds cost N samples rather than N
     builds -- the build is 4-16 s, the sample 1-15 s.
     """
-    processor, model = build(model_dir, device, dtype, num_steps, None)
+    processor, model = build(model_dir, device, dtype, num_steps, None, fuse_expert_qkv)
     model.qwenvl_with_expert.attention_precision = attention_precision
     model.qwenvl_with_expert.attention_backend = attention_backend
     if compiled_prefix:
@@ -464,6 +465,7 @@ def main() -> int:
             args.attention_precision,
             args.compile_prefix,
             args.attention_backend,
+            args.fuse_expert_qkv,
         )
         stats = aggregate([metric_stats(ref[s], chunks[s]) for s in seeds])
         stats["timestep_end"] = timestep_drift(dtype, args.num_steps)
@@ -533,6 +535,14 @@ def parse_args() -> argparse.Namespace:
         ),
         default="eager",
         help="attention backend for candidates (default: eager)",
+    )
+    parser.add_argument(
+        "--fuse-expert-qkv",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the config's expert q/k/v fusion for the candidates (Phase 9 P1). The "
+        "reference is always built from the config, because the fusion is bit-exact and a "
+        "reference that moves with the candidate cannot detect that it is not.",
     )
     parser.add_argument("--out", default=None, help="write the full report as JSON")
     return parser.parse_args()
