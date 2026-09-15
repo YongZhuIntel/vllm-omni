@@ -73,6 +73,13 @@ def prepare(args: argparse.Namespace) -> Path:
     config.attention_backend = args.attention_backend
     config.fuse_expert_qkv = args.fuse_expert_qkv
     config.fuse_expert_gate_up = args.fuse_expert_gate_up
+    # One switch. With it on, the served pipeline keeps a per-session prefix KV
+    # cache and replaces most ticks with a speculative round whose draft runs on
+    # the iGPU in a second process. `session_id` always reaches the pipeline (the
+    # OpenPI connection defaults it to "default"), so nothing else has to change.
+    config.spec_decode = args.spec_decode
+    config.spec_draft_path = args.spec_draft_path
+    config.spec_worker_cpu = args.spec_worker_cpu
     robot_config = Path(args.robot_config).resolve()
     data_config = Path(args.data_config).resolve()
     norm_stats = Path(args.norm_stats).resolve() if args.norm_stats else None
@@ -162,6 +169,25 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="fold the action expert's SwiGLU gate/up into one GEMM at load time "
         "(default: enabled; pass --no-fuse-expert-gate-up for the split path)",
+    )
+    parser.add_argument(
+        "--spec-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="speculative decoding with the draft head on the iGPU, in a second process "
+        "(default: disabled; measured 3.1x per tick at spec_full_every=4, K=2)",
+    )
+    parser.add_argument(
+        "--spec-draft-path",
+        default=None,
+        help="trained draft head for --spec-decode; random weights if unset, which is a "
+        "latency-only configuration (acceptance is 0 without a trained head)",
+    )
+    parser.add_argument(
+        "--spec-worker-cpu",
+        default=None,
+        help='CPUs reserved for the draft worker, e.g. "11". Strongly recommended: its oneCCL '
+        "recv hard-spins and unreserved it costs the server ~215 ms per full round",
     )
     parser.add_argument("--output", required=True)
     return parser.parse_args()

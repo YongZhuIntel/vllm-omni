@@ -524,6 +524,22 @@ class LingbotVlaV2Processor:
         with torch.device("cpu"):
             return self._preprocess(robot_obs)
 
+    def preprocess_state(self, robot_obs: Mapping[str, Any]) -> torch.Tensor:
+        """Just the normalized state vector, ``(1, max_state_dim)``.
+
+        A speculative round (``spec_decode``) has no use for the cameras: the
+        draft head reads the projected prefix it already holds and the verifier
+        reads the cached prefix KV. Running the Qwen3-VL image processor anyway
+        would put ~4 ms of host work into a ~24 ms tick, so this is the state half
+        of ``preprocess`` on its own, normalized identically.
+        """
+        if "state" not in robot_obs:
+            raise KeyError("robot_obs is missing 'state'")
+        with torch.device("cpu"):
+            raw = {OBS_STATE: _as_float_tensor(robot_obs["state"])}
+            state, _ = self._build_vector(raw, self.spec.state_slices, _state_key, self.config.max_state_dim)
+        return state.unsqueeze(0)
+
     def _preprocess(self, robot_obs: Mapping[str, Any]) -> RobotFeatures:
         for required in ("images", "state", "prompt"):
             if required not in robot_obs:

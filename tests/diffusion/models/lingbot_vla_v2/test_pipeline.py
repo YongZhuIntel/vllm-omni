@@ -72,7 +72,7 @@ class FakePolicy:
         return {name for name, _ in weights}
 
 
-def _pipeline(tmp_path, *, compile_denoise_step=False) -> LingbotVlaV2Pipeline:
+def _pipeline(tmp_path, *, compile_denoise_step=False, spec_decode=False) -> LingbotVlaV2Pipeline:
     config = OmniDiffusionConfig(
         model=str(tmp_path),
         model_class_name="LingbotVlaV2Pipeline",
@@ -87,6 +87,8 @@ def _pipeline(tmp_path, *, compile_denoise_step=False) -> LingbotVlaV2Pipeline:
                 "max_state_dim": 4,
                 "num_steps": 10,
                 "compile_denoise_step": compile_denoise_step,
+                "spec_decode": spec_decode,
+                "spec_max_exec_steps": 2,
             }
         ),
     )
@@ -150,6 +152,65 @@ def test_forward_synthesizes_warmup_observation(tmp_path):
     assert observation["state"].shape == (4,)
     assert observation["images"]["source_camera"].shape == (8, 8, 3)
     assert pipeline.transformer.sample_kwargs["num_steps"] == 10
+
+
+class FakeSpecDecoder:
+    """Stands in for the decoder, whose real backend is a second process."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def decode(self, observation, *, session_id, reset, noise, num_steps):
+        from vllm_omni.diffusion.models.lingbot_vla_v2.spec_decode import DecodeResult
+
+        self.calls.append({"session_id": session_id, "reset": reset, "num_steps": num_steps})
+        return DecodeResult({"action": np.full((3, 4), 7.0, dtype=np.float32)})
+
+
+def _spec_pipeline(tmp_path) -> tuple[LingbotVlaV2Pipeline, FakeSpecDecoder]:
+    """`spec_decode=True` without the iGPU: the draft process is the seam."""
+    decoder = FakeSpecDecoder()
+    with patch.object(LingbotVlaV2Pipeline, "_build_spec_decoder", return_value=decoder):
+        pipeline = _pipeline(tmp_path, spec_decode=True)
+    return pipeline, decoder
+
+
+def test_speculative_decoding_is_off_unless_the_switch_is_set(tmp_path):
+    assert _pipeline(tmp_path).spec is None
+
+
+def test_a_session_request_routes_through_the_speculative_decoder(tmp_path):
+    pipeline, decoder = _spec_pipeline(tmp_path)
+    request = _request_batch(
+        "move",
+        OmniDiffusionSamplingParams(
+            extra_args={
+                "robot_obs": {"images": {}, "state": np.zeros(4)},
+                "session_id": "robot-7",
+                "reset": True,
+                "num_steps": 3,
+            }
+        ),
+    )
+
+    output = pipeline(request)
+
+    assert decoder.calls == [{"session_id": "robot-7", "reset": True, "num_steps": 3}]
+    # The stateless path must not also run.
+    assert pipeline.transformer.sample_kwargs is None
+    np.testing.assert_array_equal(output.output["actions"], np.full((3, 4), 7.0, dtype=np.float32))
+
+
+def test_a_request_without_a_session_still_takes_the_stateless_path(tmp_path):
+    """The switch does not make sessions mandatory: warmup requests carry none."""
+    pipeline, decoder = _spec_pipeline(tmp_path)
+    request = _request_batch("warmup", OmniDiffusionSamplingParams())
+
+    output = pipeline(request)
+
+    assert decoder.calls == []
+    assert pipeline.transformer.sample_kwargs["num_steps"] == 10
+    np.testing.assert_array_equal(output.output["actions"], np.ones((3, 4), dtype=np.float32))
 
 
 def test_load_weights_delegates_to_policy(tmp_path):

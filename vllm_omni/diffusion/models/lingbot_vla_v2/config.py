@@ -181,6 +181,58 @@ class LingbotVlaV2Config:
     # 768x704 gate/up pair; one fewer dispatch per layer-step, bit-exact.
     fuse_expert_gate_up: bool = True
 
+    # --- Speculative decoding (Phase 10) ------------------------------------
+    # The one switch. With it on, a request carrying a ``session_id`` either runs
+    # a **full round** (embed_prefix + prefix_fill + num_steps Euler steps —
+    # today's path exactly) or a **speculative round**: reuse the session's prefix
+    # KV cache, take a whole chunk from the draft head, and check it with
+    # ``len(spec_t_list)`` near-terminal ``predict_velocity`` calls, accepting the
+    # longest step-prefix every timestep agrees on within ``spec_tau``.
+    #
+    # Measured on this host, 3 alternating repeats (PHASE10_SPECULATIVE.md §11):
+    # full round 294.3 ms, speculative round 45.6 ms at K=2 / 24.8 ms at K=1, so
+    # the amortised per-tick cost at ``spec_full_every=4`` is 95.8 ms (3.1x), and
+    # 79.2 ms (3.7x) at K=1.
+    #
+    # **There is deliberately no device option: the draft runs on the iGPU, in a
+    # second process.** ``torch.xpu.device_count()`` is 1 per process on this host
+    # (the two cards are different Level Zero platforms), so "draft on the iGPU"
+    # is a process boundary rather than a ``.to()``. See ``draft_igpu.py``.
+    spec_decode: bool = False
+    # Force the accept decision instead of measuring it: the fraction of
+    # speculative rounds that accept their whole horizon. The verify passes still
+    # run, so the **latency is real**; the **actions are not**, because an
+    # accepted chunk is the draft's. This exists to price the schedule at a given
+    # acceptance rate before a draft head is trained — with random weights real
+    # acceptance is 0, which turns every tick into a full round and measures
+    # nothing. Driven by ``run_openvino_comparison.sh --accept-rate``.
+    spec_force_accept_rate: float | None = None
+    # Trained draft head (Phase 10.1). Unset means random weights, which is a
+    # latency-only configuration: per-tick cost does not depend on them.
+    spec_draft_path: str | None = None
+    # Verify timesteps. K is their count, deliberately not a separate field.
+    # FLASH's default, and the pair gate 3 measured: one near-terminal step
+    # reproduces the 10-step answer to 0.0028 per-dim RMS.
+    spec_t_list: list[float] = field(default_factory=lambda: [0.10, 0.05])
+    # Accept radius as a per-dim RMS, so it does not move with the robot's DoF
+    # count. Gate 3: ``tau ~= 1.5x`` the draft's own per-dim RMS error. Below
+    # ~0.01 it is meaningless in fp16 — phase10_port_exactness measured the
+    # ``x0_hat = x_t - t*v_t`` reconstruction noise at 3.9e-3, in the same units.
+    spec_tau: float = 0.15
+    # Steps verified, and executed, before the next replan.
+    spec_max_exec_steps: int = 12
+    # Speculative rounds between full rounds. **Its ceiling is set by how stale
+    # the prefix KV cache may get, which is not yet measured** (gate 2,
+    # phase10_kv_staleness_probe.py, unrun): 4 is a placeholder, not a result.
+    spec_full_every: int = 4
+    # CPUs handed to the draft worker exclusively, e.g. "11". **Read §11.4 before
+    # trusting any measurement taken without it**: oneCCL's recv hard-spins a
+    # core, and on a 12-core host that collides with this process's OpenMP pool
+    # and takes `preprocess` from 3.9 ms to 218 ms. That also slows the
+    # non-speculative baseline, so the speculative speedup comes out *larger*
+    # than it is. ``OMP_WAIT_POLICY=PASSIVE`` is the other fix.
+    spec_worker_cpu: str | None = None
+
     def __post_init__(self) -> None:
         resolution = self.image_resolution
         if not isinstance(resolution, (tuple, list)) or len(resolution) != 2:
@@ -216,11 +268,38 @@ class LingbotVlaV2Config:
                 f"num_backbone_tokens ({self.num_backbone_tokens}) must be divisible by "
                 f"num_task_tokens ({self.num_task_tokens}) to pool the align query tables."
             )
+        if self.spec_decode:
+            self._validate_spec()
         head_width = self.expert_num_attention_heads * self.expert_head_dim
         if head_width % self.expert_num_key_value_heads:
             raise ValueError(
                 f"expert_num_attention_heads ({self.expert_num_attention_heads}) must be a "
                 f"multiple of expert_num_key_value_heads ({self.expert_num_key_value_heads})."
+            )
+
+    def _validate_spec(self) -> None:
+        """Only reached when ``spec_decode`` is on, so the defaults cost nothing."""
+        self.spec_t_list = [float(value) for value in self.spec_t_list]
+        if not self.spec_t_list:
+            raise ValueError("spec_t_list must hold at least one verify timestep (K = len(spec_t_list)).")
+        if any(not 0.0 < value < 1.0 for value in self.spec_t_list):
+            raise ValueError(
+                "spec_t_list values are flow-matching times with t=1 noise and t=0 action, so each must "
+                f"lie in (0, 1); got {self.spec_t_list}."
+            )
+        if self.spec_tau <= 0.0:
+            raise ValueError(f"spec_tau must be positive; got {self.spec_tau}.")
+        if self.spec_full_every < 1:
+            raise ValueError(
+                f"spec_full_every is the number of speculative rounds between full rounds; got {self.spec_full_every}."
+            )
+        if self.spec_max_exec_steps < 1 or self.spec_max_exec_steps > self.chunk_size:
+            raise ValueError(
+                f"spec_max_exec_steps must be in [1, chunk_size={self.chunk_size}]; got {self.spec_max_exec_steps}."
+            )
+        if self.spec_force_accept_rate is not None and not 0.0 <= self.spec_force_accept_rate <= 1.0:
+            raise ValueError(
+                f"spec_force_accept_rate is a fraction of speculative rounds; got {self.spec_force_accept_rate}."
             )
 
     # ------------------------------------------------------------------

@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.lingbot_vla_v2.processor import (
     RobotSpec,
     load_hf_processor,
 )
+from vllm_omni.diffusion.models.lingbot_vla_v2.spec_decode import SpecDecoder, prefix_shape
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
@@ -78,6 +79,13 @@ class LingbotVlaV2Pipeline(nn.Module):
             if options is not None:
                 compile_kwargs["options"] = options
             self.transformer.predict_velocity = torch.compile(self.transformer.predict_velocity, **compile_kwargs)
+        # Speculative decoding is one switch, and it owns a second process. It is
+        # built here so the iGPU worker boots while this process loads the 6B
+        # weights, rather than after. `None` means the served path below is
+        # byte-for-byte today's stateless one.
+        self.spec: SpecDecoder | None = None
+        if self.config.spec_decode:
+            self.spec = self._build_spec_decoder()
         self.vae = None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -88,6 +96,40 @@ class LingbotVlaV2Pipeline(nn.Module):
                 fall_back_to_pt=False,
             )
         ]
+
+    def _build_spec_decoder(self) -> SpecDecoder:
+        """Start the iGPU draft process and wrap it in the decoder.
+
+        Import is local so that a build without the speculative path never pays
+        for the ctypes/oneCCL module at all.
+        """
+        from vllm_omni.diffusion.models.lingbot_vla_v2.draft_igpu import IGpuDraftClient
+
+        prefix_len, prefix_width = self._prefix_shape()
+        draft = IGpuDraftClient(
+            config=self.config,
+            prefix_len=prefix_len,
+            prefix_width=prefix_width,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return SpecDecoder(
+            transformer=self.transformer,
+            processor=self.processor,
+            config=self.config,
+            device=self.device,
+            dtype=self.dtype,
+            draft=draft,
+        )
+
+    def _prefix_shape(self) -> tuple[int, int]:
+        return prefix_shape(
+            self.transformer,
+            self.processor,
+            self._dummy_observation(""),
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     @staticmethod
     def _optional_path(value: Any, model_root: Path) -> Path | None:
@@ -158,17 +200,37 @@ class LingbotVlaV2Pipeline(nn.Module):
             observation = dict(observation)
             observation.setdefault("prompt", prompt)
 
+        extra_args = request.sampling_params.extra_args
+        num_steps = extra_args.get("num_steps", self.config.num_steps)
+        session_id = extra_args.get("session_id")
+        if self.spec is not None and session_id is not None:
+            # Stateful path: the session's prefix KV cache decides whether this
+            # tick is a full round or a speculative one. `session_id`/`reset` are
+            # already carried by the OpenPI serving entrypoint, so this needed no
+            # new hook.
+            result = self.spec.decode(
+                observation,
+                session_id=str(session_id),
+                reset=bool(extra_args.get("reset", False)),
+                noise=self._noise(request),
+                num_steps=num_steps,
+            )
+            return DiffusionOutput(output={"actions": self._single_action(result.actions)})
+
         features = self.processor.preprocess(observation)
         model_features = features.to(device=self.device, dtype=self.dtype)
         actions = self.transformer.sample_actions(
             **model_features.model_inputs(),
             noise=self._noise(request),
-            num_steps=request.sampling_params.extra_args.get("num_steps", self.config.num_steps),
+            num_steps=num_steps,
         )
-        robot_actions = self.processor.postprocess(actions, features)
+        return DiffusionOutput(output={"actions": self._single_action(self.processor.postprocess(actions, features))})
+
+    @staticmethod
+    def _single_action(robot_actions: Mapping[str, Any]) -> Any:
         if len(robot_actions) != 1:
             raise ValueError(f"action output must resolve to one robot source key; got {sorted(robot_actions)}")
-        return DiffusionOutput(output={"actions": next(iter(robot_actions.values()))})
+        return next(iter(robot_actions.values()))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The loader compares the returned names against this pipeline's own

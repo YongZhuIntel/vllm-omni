@@ -145,9 +145,12 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
 
     images, states, actions, prompts = [], [], [], []
     episode_ids, frame_indices, valid_steps = [], [], []
+    stride = args.horizon if getattr(args, "stride", None) is None else int(args.stride)
+    if stride < 1:
+        raise ValueError(f"--stride must be >= 1, got {stride}")
     for episode_id in args.episodes:
         start, end = _episode_bounds(dataset, LEROBOT_DATASET_API, episode_id)
-        for chunk_index, data_index in enumerate(range(start, end, args.horizon)):
+        for chunk_index, data_index in enumerate(range(start, end, stride)):
             if args.max_chunks_per_episode is not None and chunk_index >= args.max_chunks_per_episode:
                 break
             sample = dataset[data_index]
@@ -183,6 +186,7 @@ def export(args: argparse.Namespace) -> dict[str, Any]:
         "data_path": args.data_path,
         "episodes": args.episodes,
         "horizon": args.horizon,
+        "stride": stride,
         "num_samples": len(states),
         "lerobot_api": LEROBOT_DATASET_API,
         "camera_keys": list(CAMERA_KEYS),
@@ -201,6 +205,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="output .npz path")
     parser.add_argument("--episodes", type=int, nargs="+", default=[0])
     parser.add_argument("--horizon", type=int, default=50)
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help=(
+            "Frames between consecutive samples (default: --horizon, i.e. non-overlapping "
+            "chunks). Use 1 for the dense, consecutive-frame bundles the speculative "
+            "KV-staleness probe and the draft-head training cache need."
+        ),
+    )
     parser.add_argument("--max-chunks-per-episode", type=int, default=10)
     parser.add_argument("--robot-config", default="configs/robot_configs/robotwin.yaml")
     parser.add_argument("--data-config", default="configs/vla/robotwin/robotwin.yaml")
