@@ -214,6 +214,41 @@ class LingbotVlaV2Config:
     # FLASH's default, and the pair gate 3 measured: one near-terminal step
     # reproduces the 10-step answer to 0.0028 per-dim RMS.
     spec_t_list: list[float] = field(default_factory=lambda: [0.10, 0.05])
+    # Run the K verify timesteps as one ``B*K`` batch instead of K sequential
+    # ``predict_velocity`` calls. Measured by ``phase10_verify_batch_sweep.py``,
+    # 3 interleaved repeats, compiled, one Euler step = 22.6 ms:
+    #
+    #     K      sequential   batched   vs sequential   vs K=1
+    #     1          22.8       22.8        1.00x        1.00x
+    #     2          44.2       30.6        1.44x        1.34x
+    #     4          86.9       46.8        1.85x        2.05x
+    #     8         172.7       78.6        2.20x        3.39x
+    #     10        215.8       90.5        2.38x        3.90x
+    #
+    # So it is worth having -- at the shipped K=2 it takes a speculative round's
+    # verify from 44.2 to 30.6 ms -- but it is **not free**, and the roofline
+    # argument for why it would be free only covers part of the step. The MoE
+    # GEMMs are weight-streaming bound at ``M = 51`` suffix tokens (75.5 MB of
+    # expert weights per layer-step, 51 FLOP/byte against this device's measured
+    # balance of 207) and batch at 0.19x of linear, 0.251 -> 0.298 ms at M=102.
+    # But they are only 44% of a layer-step (PHASE9_FLASHRT.md §1); attention
+    # including the prefix KV ``cat``, the fused q/k/v and the norms are not
+    # weight-bound and measure ~0.78x of linear. Blended, K=2 costs 1.34x rather
+    # than the 1.19x the GEMM row alone suggests. Do not quote F2's numbers as
+    # step costs.
+    #
+    # Also: the prefix KV is materialised K times -- 42.2 MB * K, so 422 MB of
+    # the 22.71 GiB at K=10 -- and ``predict_velocity`` is compiled
+    # ``dynamic=False`` (pipeline), so B=1 for the full round's Euler loop and
+    # B=K for verify are two specialisations: two warmups, two graphs.
+    #
+    # **Raising K does not raise the accept rate**, so do not reach for a large
+    # K because it got cheap: ``radius_prefix_acceptance`` takes ``min`` over the
+    # K timesteps, a conjunction, so every added timestep is another veto and the
+    # accept rate falls monotonically. K>1 buys robustness against a single
+    # near-terminal ``t`` that happens to flatter a wrong draft -- that is all it
+    # buys. Batching is what makes K=2's robustness cost K=1's latency.
+    spec_verify_batched: bool = True
     # Accept radius as a per-dim RMS, so it does not move with the robot's DoF
     # count. Gate 3: ``tau ~= 1.5x`` the draft's own per-dim RMS error. Below
     # ~0.01 it is meaningless in fp16 — phase10_port_exactness measured the
@@ -224,7 +259,62 @@ class LingbotVlaV2Config:
     # Speculative rounds between full rounds. **Its ceiling is set by how stale
     # the prefix KV cache may get, which is not yet measured** (gate 2,
     # phase10_kv_staleness_probe.py, unrun): 4 is a placeholder, not a result.
+    # Inert when ``spec_reground`` is on -- see there.
     spec_full_every: int = 4
+    # Re-ground every speculative round on **this tick's** observation
+    # (``embed_prefix`` + ``prefix_forward`` + a draft refresh off the fresh
+    # embeddings) instead of reusing the last full round's prefix KV, and fall
+    # back to the Euler loop **inside the rejecting tick** instead of returning
+    # ``x0_tail`` and deferring a full round to the next one.
+    #
+    # Two consequences, and they are the whole reason to want it:
+    #
+    # * **Nothing is stale.** The verify's teacher reads this tick's images, so
+    #   ``spec_full_every`` and ``pending_full`` stop applying (``_wants_full``
+    #   skips both, leaving one full round per session to create it) and gate 2
+    #   stops gating. What is left is the *draft's* staleness, which is bounded by
+    #   the tick, not by the schedule.
+    # * **A rejected round never executes a guess.** With this off, accept=0 still
+    #   returns ``stitch_prefix(x0_draft, x0_tail, 0)`` -- entirely ``x0_tail``,
+    #   one near-terminal step's estimate built from the draft that was just
+    #   rejected. That is a latent quality risk, not a latency one, and this is
+    #   what removes it.
+    #
+    # Off by default because it **loses on latency at every acceptance rate**.
+    # Measured by ``test_spec_oneccl.sh``, 60 ticks per arm, dGPU + iGPU draft
+    # over oneCCL, compiled, K=2 (PHASE10_SPECULATIVE.md §12.9) -- per-round
+    # medians first, because those are the structural numbers:
+    #
+    #     full round (both schemes)             301.0 ms
+    #     cached    speculative round            35.2
+    #     reground  accepting round             121.0   (= 35.2 + 86 grounding)
+    #     reground  rejecting round             330.2   (= a full round + verify)
+    #     no speculation at all                 292.6
+    #
+    # and then per tick, against ``spec_full_every=4``:
+    #
+    #     accept    0    0.25    0.5   0.75    0.9      1
+    #     cached  169.0  145.8  125.1  105.5   92.1   88.5
+    #     reground 330.5  279.1  229.9  181.7  142.1  123.0
+    #     ratio    1.96x  1.91x  1.84x  1.72x  1.54x  1.39x
+    #
+    # Two things to take from that, and the second is the one that matters:
+    #
+    # 1. Re-grounding costs 1.39x even at **perfect** acceptance, because the
+    #    80.8 ms grounding it pays every tick is no longer amortised, and 1.96x
+    #    at acceptance 0, where each tick is a full round plus a wasted draft and
+    #    a wasted verify. At today's real acceptance -- 0, no trained head -- it
+    #    is *slower than not speculating at all*: 330.5 against 292.6. It first
+    #    beats the non-speculative baseline around acceptance 0.25.
+    # 2. But the cached scheme's cheap end is **bought with action quality, not
+    #    won**. Its 169.0 ms at acceptance 0 is ``(301.0 + 35.2) / 2``: every
+    #    other tick returns ``x0_tail`` off a draft that was just rejected,
+    #    against a teacher reading the previous tick's frame. Re-grounding never
+    #    does either. So this is not "1.96x slower for nothing" -- it is the
+    #    price of the two guarantees, and whether they are worth it is a
+    #    closed-loop question no latency sweep can answer. Gate 2
+    #    (phase10_kv_staleness_probe.py, unrun) is the cheaper way to ask it.
+    spec_reground: bool = False
     # CPUs handed to the draft worker exclusively, e.g. "11". **Read §11.4 before
     # trusting any measurement taken without it**: oneCCL's recv hard-spins a
     # core, and on a 12-core host that collides with this process's OpenMP pool

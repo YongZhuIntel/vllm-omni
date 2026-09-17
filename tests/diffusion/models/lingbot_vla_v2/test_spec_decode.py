@@ -23,6 +23,7 @@ from vllm_omni.diffusion.models.lingbot_vla_v2.draft_igpu import LingbotDraftHea
 from vllm_omni.diffusion.models.lingbot_vla_v2.processor import JointGroup, RobotSpec, SourceSlice
 from vllm_omni.diffusion.models.lingbot_vla_v2.spec_decode import (
     SpecDecoder,
+    _expand_rows,
     gripper_dims,
     pose_dims,
     radius_prefix_acceptance,
@@ -114,7 +115,9 @@ class FakeTransformer:
         self.teacher = torch.zeros(1, CHUNK, ACTION_DIM)
         self.verify_target = torch.zeros(1, CHUNK, ACTION_DIM)
         self.velocity_calls = 0
+        self.velocity_rows: list[int] = []
         self.prefix_fills = 0
+        self.denoise_calls = 0
 
     def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, image_grid_thw):
         embs = torch.zeros(1, 5, 8)
@@ -128,11 +131,22 @@ class FakeTransformer:
         return None, [(torch.zeros(1, 1, 5, 2), torch.zeros(1, 1, 5, 2))]
 
     def denoise_actions(self, *, state, prefix_pad_masks, prefix_position_ids, past_key_values, noise, num_steps):
+        self.denoise_calls += 1
         return self.teacher.clone()
 
     def predict_velocity(self, *, state, prefix_pad_masks, prefix_position_ids, past_key_values, x_t, timestep):
         self.velocity_calls += 1
-        t = float(timestep.reshape(-1)[0])
+        rows = int(x_t.shape[0])
+        # Every conditioning tensor must have been expanded to the same B*K, or
+        # the batched verify is silently pairing a row with another row's prefix.
+        # ``prefix_position_ids`` is ``[3,B,S]``, so its batch axis is 1.
+        assert state.shape[0] == rows
+        assert prefix_pad_masks.shape[0] == rows
+        assert prefix_position_ids.shape[1] == rows
+        for key, value in past_key_values:
+            assert key.shape[0] == rows and value.shape[0] == rows
+        self.velocity_rows.append(rows)
+        t = timestep.reshape(rows, *([1] * (x_t.ndim - 1)))
         return (x_t - self.verify_target) / t
 
 
@@ -161,6 +175,8 @@ class StubDraft:
 
     def refresh(self, prefix_embs, state):
         self.refreshes += 1
+        if self.fail:
+            raise RuntimeError("draft worker died")
         return self.chunk.clone()
 
     def draft(self, state):
@@ -232,6 +248,71 @@ def test_stitch_takes_the_accepted_prefix_from_the_draft_and_the_rest_from_verif
     stitched = stitch_prefix(draft, tail, torch.tensor([2]))
     assert torch.equal(stitched[0, :2], draft[0, :2])
     assert torch.equal(stitched[0, 2:], tail[0, 2:])
+
+
+# -- batched verify ---------------------------------------------------------
+def test_expand_rows_is_b_major_and_handles_the_mrope_layout():
+    rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    # row = b*K + k, so each source row is repeated K times before the next.
+    assert torch.equal(
+        _expand_rows(rows, 3), torch.tensor([[1.0, 2.0]] * 3 + [[3.0, 4.0]] * 3)
+    )
+    # K=1 must not copy: the sequential path shares the session's tensors.
+    assert _expand_rows(rows, 1) is rows
+    # ``prefix_position_ids`` is [3,B,S] -- expanding the wrong axis would give
+    # [3*K,B,S] and pass a shape check while pairing rows with wrong positions.
+    position_ids = torch.zeros(3, 2, 5, dtype=torch.long)
+    assert _expand_rows(position_ids, 4, dim=1).shape == (3, 8, 5)
+
+
+@pytest.mark.parametrize("k", [1, 2, 4])
+def test_batched_verify_agrees_with_sequential_and_costs_one_call(k):
+    t_list = [0.10, 0.05, 0.08, 0.03][:k]
+    draft_chunk = torch.full((1, CHUNK, ACTION_DIM), 0.5)
+
+    results = {}
+    for batched in (False, True):
+        decoder, transformer, _, _ = build_decoder(
+            draft_chunk=draft_chunk,
+            config=spec_config(spec_t_list=t_list, spec_verify_batched=batched),
+        )
+        transformer.verify_target = draft_chunk.clone()
+        tick(decoder, 0.0)  # full round primes the session
+        transformer.velocity_calls, transformer.velocity_rows = 0, []
+        result = tick(decoder, 1.0)
+        results[batched] = (result.stats.accepted, result.actions["action"], transformer.velocity_rows)
+
+    sequential, batched = results[False], results[True]
+    assert sequential[0] == batched[0] == EVAL_H
+    np.testing.assert_allclose(sequential[1], batched[1])
+    # K sequential calls at batch 1, against one call at batch K.
+    assert sequential[2] == [1] * k
+    assert batched[2] == ([1] * k if k == 1 else [k])
+
+
+def test_batched_verify_keeps_each_row_on_its_own_timestep():
+    """A row/timestep swap is invisible unless ``x0_hat`` depends on ``t``."""
+    t_list = [0.11, 0.07, 0.03]
+    decoder, transformer, _, _ = build_decoder(
+        draft_chunk=torch.zeros(1, CHUNK, ACTION_DIM),
+        config=spec_config(spec_t_list=t_list, spec_verify_batched=True),
+    )
+
+    # Make the teacher answer "whatever t you asked me at", so x0_hat[0,k] must
+    # come back filled with t_list[k] exactly when the rows line up.
+    def velocity(*, state, prefix_pad_masks, prefix_position_ids, past_key_values, x_t, timestep):
+        t = timestep.reshape(-1, *([1] * (x_t.ndim - 1)))
+        return (x_t - t.expand_as(x_t)) / t
+
+    tick(decoder, 0.0)
+    transformer.predict_velocity = velocity
+    session = decoder.sessions["s"]
+    zeros = torch.zeros(1, CHUNK, ACTION_DIM)
+    x0_hat = decoder._verify(session, torch.zeros(1, STATE_DIM), zeros, zeros)
+
+    assert x0_hat.shape == (1, len(t_list), CHUNK, ACTION_DIM)
+    for index, t in enumerate(t_list):
+        assert torch.allclose(x0_hat[0, index], torch.full((CHUNK, ACTION_DIM), t), atol=1e-6)
 
 
 def test_gripper_switch_truncates_the_accepted_prefix_at_the_flip():
@@ -325,6 +406,105 @@ def test_a_dead_draft_worker_degrades_to_full_rounds_instead_of_failing():
     assert [tick(decoder, index).stats.kind for index in range(3)] == ["full", "full", "full"]
 
 
+# -- spec_reground ----------------------------------------------------------
+def test_reground_grounds_every_tick_and_stops_deferring_full_rounds():
+    """``spec_full_every`` is inert: nothing is stale, so nothing expires."""
+    chunk = torch.zeros(1, CHUNK, ACTION_DIM)
+    decoder, transformer, processor, draft = build_decoder(
+        draft_chunk=chunk, config=spec_config(spec_reground=True, spec_full_every=2)
+    )
+    transformer.verify_target = chunk.clone()  # the verifier agrees with the draft
+
+    kinds = [tick(decoder, index).stats.kind for index in range(6)]
+    # One full round to create the session, and then never again -- against
+    # ["full","spec","spec","full",...] for the cached scheme at full_every=2.
+    assert kinds == ["full"] + ["spec"] * 5
+    # The prefix is filled on *every* tick, which is what this costs.
+    assert transformer.prefix_fills == 6
+    assert processor.preprocess_calls == 6
+    # And `preprocess_state` is never reached: the state comes out of the same
+    # `preprocess` that built the prefix, so there is no second path for it.
+    assert processor.state_calls == 0
+    # The draft is refreshed off the fresh embeddings, not asked for a chunk
+    # against a projection it made last tick.
+    assert draft.refreshes == 6 and draft.drafts == 0
+    assert transformer.denoise_calls == 1  # the full round only; nothing rejected
+
+
+def test_reground_rejection_denoises_in_its_own_tick_instead_of_executing_x0_tail():
+    """The quality fix, and the reason this scheme costs what it costs.
+
+    The cached scheme's rejected tick returns ``x0_tail`` -- one near-terminal
+    step's estimate off the draft it just rejected -- and defers a full round to
+    the next tick. Re-grounding pays the Euler loop on the spot and returns the
+    teacher's actual answer.
+    """
+    teacher = torch.full((1, CHUNK, ACTION_DIM), 7.0)
+    tail = torch.full((1, CHUNK, ACTION_DIM), 5.0)
+
+    outcomes = {}
+    for reground in (False, True):
+        decoder, transformer, _, _ = build_decoder(
+            draft_chunk=torch.zeros(1, CHUNK, ACTION_DIM),
+            config=spec_config(spec_reground=reground, spec_full_every=1000),
+        )
+        transformer.teacher = teacher.clone()
+        transformer.verify_target = tail.clone()  # far from the draft: accept 0
+        tick(decoder, 0.0)
+        before = transformer.denoise_calls
+        result = tick(decoder, 1.0)
+        outcomes[reground] = (result.stats, result.actions["action"], transformer.denoise_calls - before)
+
+    cached_stats, cached_action, cached_denoises = outcomes[False]
+    regrounded_stats, regrounded_action, regrounded_denoises = outcomes[True]
+
+    assert cached_stats.accepted == regrounded_stats.accepted == 0
+    # Cached: no Euler loop in this tick, and the executed chunk is x0_tail.
+    assert cached_denoises == 0 and not cached_stats.fell_back
+    np.testing.assert_allclose(cached_action, tail[0].numpy(), atol=1e-5)
+    # Re-grounded: one Euler loop in this tick, and the teacher's own answer.
+    assert regrounded_denoises == 1 and regrounded_stats.fell_back
+    assert regrounded_stats.regrounded
+    np.testing.assert_allclose(regrounded_action, teacher[0].numpy(), atol=1e-5)
+
+
+def test_reground_does_not_denoise_when_only_the_gripper_guard_cut():
+    """A truncated accept is still real accepted steps, so there is nothing to redo."""
+    chunk = torch.zeros(1, CHUNK, ACTION_DIM)
+    chunk[0, 3:, 5] = -1.0  # the right gripper crosses zero at step 3
+    decoder, transformer, _, _ = build_decoder(
+        draft_chunk=chunk, config=spec_config(spec_reground=True, spec_full_every=1000)
+    )
+    transformer.verify_target = chunk.clone()  # the pose dims agree exactly
+
+    tick(decoder, 0.0)
+    before = transformer.denoise_calls
+    stats = tick(decoder, 1.0).stats
+
+    assert stats.accepted == 3 and stats.gripper_cut
+    assert not stats.fell_back
+    assert transformer.denoise_calls == before
+
+
+def test_reground_reuses_the_prefix_it_built_when_the_draft_worker_dies():
+    """The failure path must not ground twice: it already holds a fresh prefix."""
+    chunk = torch.zeros(1, CHUNK, ACTION_DIM)
+    decoder, transformer, _, draft = build_decoder(
+        draft_chunk=chunk, config=spec_config(spec_reground=True, spec_full_every=1000)
+    )
+    transformer.verify_target = chunk.clone()
+
+    tick(decoder, 0.0)
+    assert transformer.prefix_fills == 1
+    draft.fail = True
+    result = tick(decoder, 1.0)
+
+    assert result.stats.kind == "full"  # the tick still answers
+    assert decoder.draft_failed
+    assert transformer.prefix_fills == 2  # one grounding for this tick, not two
+    assert [tick(decoder, index).stats.kind for index in range(2)] == ["full", "full"]
+
+
 # -- forced acceptance ------------------------------------------------------
 @pytest.mark.parametrize("rate", [0.0, 1.0])
 def test_forced_acceptance_drives_the_schedule_and_still_runs_verify(rate):
@@ -344,8 +524,9 @@ def test_forced_acceptance_drives_the_schedule_and_still_runs_verify(rate):
     else:
         assert kinds == ["full", "spec", "full", "spec", "full", "spec"]
     # The latency has to stay real: K verify passes per speculative round either
-    # way. That is the whole premise of the sweep.
-    assert transformer.velocity_calls == spec_rounds * len(decoder.config.spec_t_list)
+    # way. That is the whole premise of the sweep. Counted in *rows*, not calls,
+    # so the invariant holds for both the batched and the sequential path.
+    assert sum(transformer.velocity_rows) == spec_rounds * len(decoder.config.spec_t_list)
 
 
 def test_forced_acceptance_survives_the_gripper_guard():

@@ -8,7 +8,19 @@ cache from the last full round, take a whole action chunk from a small draft hea
 running on the iGPU, and check it with ``K = len(spec_t_list)`` near-terminal
 ``predict_velocity`` calls instead of ten sequential ones. Measured 45.6 ms at
 K=2 and 24.8 ms at K=1, i.e. 95.8 ms per tick amortised at ``spec_full_every=4``
-(3.1x); see ``spikes/lingbot_vla_v2/PHASE10_SPECULATIVE.md`` §11.
+(3.1x); see ``spikes/lingbot_vla_v2/PHASE10_SPECULATIVE.md`` §11. Those two
+figures are the **sequential** verify; ``spec_verify_batched`` (default) takes
+K=2's verify from 42.6 to 30.6 ms measured (§12.8), which carried through §11's
+own arithmetic puts the amortised tick near 86 ms -- derived, not re-measured.
+
+That is the **cached** scheme, and its cost is low because its verifier is
+stale: the teacher reads the prefix KV of whichever tick last ran a full round.
+``spec_reground`` switches to the alternative -- ground every speculative round
+on its own observation, draft off the fresh embeddings, and absorb a rejection
+with an Euler loop inside the rejecting tick. Nothing is stale and no tick
+executes a one-step guess, but grounding is no longer amortised and a rejection
+is no longer free. Which one wins is entirely a function of the accept rate;
+``spikes/lingbot_vla_v2/test_spec_oneccl.sh`` sweeps both over K and acceptance.
 
 The accept rule is a port of Dexmal RealtimeVLA-FLASH's radius-prefix
 acceptance, and the flow-matching conventions line up exactly, which is why it is
@@ -130,12 +142,17 @@ def prefix_shape(
 # ---------------------------------------------------------------------------
 # Verify algebra
 # ---------------------------------------------------------------------------
-def build_x_t(noise: torch.Tensor, x0_draft: torch.Tensor, t: float) -> torch.Tensor:
-    """``x_t = t*noise + (1-t)*x0`` -- the forward interpolation the model trained on."""
+def build_x_t(noise: torch.Tensor, x0_draft: torch.Tensor, t: float | torch.Tensor) -> torch.Tensor:
+    """``x_t = t*noise + (1-t)*x0`` -- the forward interpolation the model trained on.
+
+    ``t`` may also be a tensor that broadcasts against the operands, which is how
+    the batched verify builds all K timesteps at once. Scalar ``t`` is unchanged,
+    so ``phase10_port_exactness.py`` still guards this against FLASH.
+    """
     return t * noise + (1.0 - t) * x0_draft
 
 
-def x0_from_velocity(x_t: torch.Tensor, t: float, v_t: torch.Tensor) -> torch.Tensor:
+def x0_from_velocity(x_t: torch.Tensor, t: float | torch.Tensor, v_t: torch.Tensor) -> torch.Tensor:
     """``x0_hat = x_t - t*v_t`` -- one near-terminal step's estimate of the answer."""
     return x_t - t * v_t
 
@@ -175,6 +192,21 @@ def radius_prefix_acceptance(
     # A step counts only if every verify timestep accepted it and every earlier
     # step did too -- the min over K of each arm's own prefix length.
     return ok.sum(dim=2).min(dim=1).values, dist
+
+
+def _expand_rows(x: torch.Tensor, k: int, *, dim: int = 0) -> torch.Tensor:
+    """Repeat each row of ``dim`` ``k`` times, b-major, folding it into ``dim``.
+
+    ``[B, ...] -> [B*K, ...]`` with ``row = b*K + k``. The result is a copy: an
+    expanded stride cannot survive the reshape, and the attention path wants a
+    real tensor. That copy is the prefix KV's ``42.2 MB * K``.
+    """
+    if k == 1:
+        return x
+    shape = list(x.shape)
+    return x.unsqueeze(dim + 1).expand(*shape[: dim + 1], k, *shape[dim + 1 :]).reshape(
+        *shape[:dim], shape[dim] * k, *shape[dim + 1 :]
+    )
 
 
 def stitch_prefix(x0_draft: torch.Tensor, x0_tail: torch.Tensor, accepted_prefix_len: torch.Tensor) -> torch.Tensor:
@@ -263,6 +295,24 @@ class SpecSession:
 
 
 @dataclass
+class _Grounding:
+    """One tick's fresh prefix, as ``embed_prefix`` + ``prefix_forward`` leave it.
+
+    Exists so the two schemes can share the expensive half of a full round: a
+    ``spec_reground`` speculative round builds one of these too, and its
+    rejection fallback runs the Euler loop over the same object rather than
+    paying for a second ``_ground``.
+    """
+
+    features: Any
+    inputs: dict
+    embs: torch.Tensor
+    pad_masks: torch.Tensor
+    position_ids: torch.Tensor
+    past_key_values: list
+
+
+@dataclass
 class SpecStats:
     """Per-round record. The pipeline ignores it; the latency sweep reads it."""
 
@@ -274,6 +324,13 @@ class SpecStats:
     forced: bool = False
     dist_mean: float | None = None
     draft_rms: float | None = None
+    # ``spec_reground`` only: this round rejected and ran the Euler loop in its
+    # own tick. Kept off ``kind`` so existing consumers keep seeing "full"/"spec",
+    # and reported separately by the sweep because it is the expensive tail.
+    fell_back: bool = False
+    # Whether this round re-grounded on its own observation. Distinguishes the
+    # two schemes in a report without the reader having to know the config.
+    regrounded: bool = False
 
 
 @dataclass
@@ -344,12 +401,16 @@ class SpecDecoder:
 
     def _wants_full(self, session_id: str) -> bool:
         session = self.sessions.get(session_id)
-        return (
-            self.draft_failed
-            or session is None
-            or session.pending_full
-            or session.rounds_since_full >= self.config.spec_full_every
-        )
+        if self.draft_failed or session is None:
+            return True
+        if self.config.spec_reground:
+            # Both remaining conditions are staleness guards, and under
+            # ``spec_reground`` nothing is stale: the speculative round builds its
+            # own prefix from this tick's observation and absorbs its own
+            # rejection. So one full round per session, to create it, and then
+            # never again.
+            return False
+        return session.pending_full or session.rounds_since_full >= self.config.spec_full_every
 
     # -- rounds ------------------------------------------------------------
     def decode(
@@ -376,9 +437,12 @@ class SpecDecoder:
             (1, self.config.chunk_size, self.config.max_action_dim), device=self.device, dtype=self.dtype
         )
 
-    def _full_round(
-        self, observation: dict, *, session_id: str, noise: torch.Tensor, num_steps: int
-    ) -> DecodeResult:
+    def _ground(self, observation: dict) -> _Grounding:
+        """Preprocess, embed the prefix, fill its KV cache. 80.8 ms (§11).
+
+        The expensive half of a full round, and exactly what a speculative round
+        skips when ``spec_reground`` is off.
+        """
         from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import make_att_2d_masks
 
         features = self.processor.preprocess(observation)
@@ -397,50 +461,114 @@ class SpecDecoder:
             visual_pos_masks=visual_masks,
             deepstack_visual_embeds=deepstack,
         )
-
-        stats = SpecStats(kind="full", eval_h=self.config.spec_max_exec_steps)
-        x0_draft = self._refresh_draft(embs, inputs["state"])
-
-        x0 = self.transformer.denoise_actions(
-            state=inputs["state"],
-            prefix_pad_masks=pad_masks,
-            prefix_position_ids=position_ids,
-            past_key_values=past_key_values,
-            noise=noise,
-            num_steps=num_steps,
-        )
-        if x0_draft is not None:
-            stats.draft_rms = self._draft_rms(x0_draft, x0)
-
-        session = SpecSession(
+        return _Grounding(
+            features=features,
+            inputs=inputs,
+            embs=embs,
             pad_masks=pad_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            features=features,
         )
+
+    def _denoise(self, ground: _Grounding, *, noise: torch.Tensor, num_steps: int) -> torch.Tensor:
+        """The Euler loop over a grounding. 213 ms of a full round's 294 (§11)."""
+        return self.transformer.denoise_actions(
+            state=ground.inputs["state"],
+            prefix_pad_masks=ground.pad_masks,
+            prefix_position_ids=ground.position_ids,
+            past_key_values=ground.past_key_values,
+            noise=noise,
+            num_steps=num_steps,
+        )
+
+    def _adopt(self, session_id: str, ground: _Grounding) -> SpecSession:
+        """Make ``ground`` the session's prefix, creating the session if needed.
+
+        A full round starts a session over; a re-grounding speculative round only
+        replaces the prefix, because ``gripper_prev`` and the round counters are
+        continuity that has to survive the swap.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            session = SpecSession(
+                pad_masks=ground.pad_masks,
+                position_ids=ground.position_ids,
+                past_key_values=ground.past_key_values,
+                features=ground.features,
+            )
+            self.sessions[session_id] = session
+            return session
+        session.pad_masks = ground.pad_masks
+        session.position_ids = ground.position_ids
+        session.past_key_values = ground.past_key_values
+        session.features = ground.features
+        return session
+
+    def _full_round(
+        self,
+        observation: dict,
+        *,
+        session_id: str,
+        noise: torch.Tensor,
+        num_steps: int,
+        ground: _Grounding | None = None,
+    ) -> DecodeResult:
+        """``_ground`` plus ``num_steps`` Euler steps -- today's path exactly.
+
+        ``ground`` lets a caller that already built this tick's prefix hand it
+        over rather than pay the 80.8 ms twice; the only caller that does is a
+        re-grounding speculative round whose draft worker just died.
+        """
+        if ground is None:
+            ground = self._ground(observation)
+
+        stats = SpecStats(kind="full", eval_h=self.config.spec_max_exec_steps)
+        x0_draft = self._refresh_draft(ground.embs, ground.inputs["state"])
+
+        x0 = self._denoise(ground, noise=noise, num_steps=num_steps)
+        if x0_draft is not None:
+            stats.draft_rms = self._draft_rms(x0_draft, x0)
+
+        self.reset(session_id)
+        session = self._adopt(session_id, ground)
         session.gripper_prev = self._gripper_of(x0)
-        self.sessions[session_id] = session
         self.rounds["full"] += 1
-        return DecodeResult(self.processor.postprocess(x0, features), stats)
+        return DecodeResult(self.processor.postprocess(x0, ground.features), stats)
 
     def _spec_round(
         self, observation: dict, *, session_id: str, noise: torch.Tensor, num_steps: int
     ) -> DecodeResult:
-        del num_steps  # a speculative round has no Euler loop to size
         session = self.sessions[session_id]
-        # Only the state is needed: the draft holds its own projected prefix and
-        # the verifier reads the cached KV, so the image processor is skipped.
-        state = self.processor.preprocess_state(observation).to(device=self.device, dtype=self.dtype)
+        ground = self._ground(observation) if self.config.spec_reground else None
 
-        try:
-            x0_draft = self.draft.draft(state)
-        except Exception:
-            logger.exception("LingBot draft worker failed; falling back to full rounds for every tick")
-            self.draft_failed = True
-            session.pending_full = True
-            return self._full_round(
-                observation, session_id=session_id, noise=noise, num_steps=self.config.num_steps
-            )
+        if ground is not None:
+            # This tick owns its whole prefix, so the draft gets the fresh
+            # embeddings too: a draft conditioned on last tick's frame is the
+            # other half of the staleness this scheme exists to remove.
+            session = self._adopt(session_id, ground)
+            state = ground.inputs["state"]
+            x0_draft = self._refresh_draft(ground.embs, state)
+            if x0_draft is None:
+                # The worker just died, and ``draft_failed`` makes every later
+                # tick a full round. Finish this one as a full round over the
+                # prefix already in hand rather than grounding twice.
+                return self._full_round(
+                    observation, session_id=session_id, noise=noise, num_steps=num_steps, ground=ground
+                )
+        else:
+            # Only the state is needed: the draft holds its own projected prefix
+            # and the verifier reads the cached KV, so the image processor is
+            # skipped.
+            state = self.processor.preprocess_state(observation).to(device=self.device, dtype=self.dtype)
+            try:
+                x0_draft = self.draft.draft(state)
+            except Exception:
+                logger.exception("LingBot draft worker failed; falling back to full rounds for every tick")
+                self.draft_failed = True
+                session.pending_full = True
+                return self._full_round(
+                    observation, session_id=session_id, noise=noise, num_steps=num_steps
+                )
 
         x0_hat = self._verify(session, state, noise, x0_draft)
         x0_tail = x0_hat.mean(dim=1)
@@ -464,12 +592,27 @@ class SpecDecoder:
 
         accepted_len = int(accepted.item())
         session.rounds_since_full += 1
-        session.gripper_prev = self._gripper_of(x0_out)
-        # FLASH's rule: nothing accepted, or a speculated gripper transition,
-        # means the next tick re-grounds on a fresh observation.
-        if accepted_len == 0 or bool(cut.any().item()):
-            session.pending_full = True
+        rejected = accepted_len == 0 or bool(cut.any().item())
+        if rejected:
             self.rounds["reject"] += 1
+
+        fell_back = False
+        if ground is None:
+            # FLASH's rule: nothing accepted, or a speculated gripper transition,
+            # means the next tick re-grounds on a fresh observation.
+            if rejected:
+                session.pending_full = True
+        elif accepted_len == 0:
+            # Nothing to defer to -- this scheme has no next-tick full round --
+            # and ``x0_tail`` off a draft that was just rejected is not an action
+            # worth executing. So pay the Euler loop here, over the prefix this
+            # tick already built. A gripper cut with a non-empty accept does
+            # *not* land here: what survives truncation is real accepted draft
+            # steps, and there is no staleness left for a full round to repair.
+            x0_out = self._denoise(ground, noise=noise, num_steps=num_steps)
+            fell_back = True
+
+        session.gripper_prev = self._gripper_of(x0_out)
         self.rounds["spec"] += 1
         stats = SpecStats(
             kind="spec",
@@ -479,6 +622,8 @@ class SpecDecoder:
             rounds_since_full=session.rounds_since_full,
             forced=forced,
             dist_mean=float(dist.mean().item()),
+            fell_back=fell_back,
+            regrounded=ground is not None,
         )
         return DecodeResult(self.processor.postprocess(x0_out, session.features), stats)
 
@@ -488,12 +633,19 @@ class SpecDecoder:
     ) -> torch.Tensor:
         """K near-terminal steps -> ``x0_hat`` stacked as ``[B,K,H,D]``.
 
-        Run **sequentially**, one ``predict_velocity`` per timestep, rather than as
-        one ``B*K`` batch. FLASH batches, but that materialises the 42.2 MB prefix
-        KV cache K times on a device where the loop is already bound by weight
-        streaming. At K=2 the sequential cost is 2x21.7 ms measured and it needs
-        no change to the attention path.
+        Batched or sequential per ``spec_verify_batched``; the two agree to fp
+        tolerance, not bit-exactly, because a ``B*K`` GEMM reduces in a different
+        order than K separate ones. See that field for why batching is cheap and
+        where it stops being cheap.
         """
+        if self.config.spec_verify_batched and len(self.config.spec_t_list) > 1:
+            return self._verify_batched(session, state, noise, x0_draft)
+        return self._verify_sequential(session, state, noise, x0_draft)
+
+    def _verify_sequential(
+        self, session: SpecSession, state: torch.Tensor, noise: torch.Tensor, x0_draft: torch.Tensor
+    ) -> torch.Tensor:
+        """One ``predict_velocity`` per timestep. The fallback, and the reference."""
         batch = int(state.shape[0])
         hats = []
         for t in self.config.spec_t_list:
@@ -508,6 +660,34 @@ class SpecDecoder:
             )
             hats.append(x0_from_velocity(x_t, t, v_t))
         return torch.stack(hats, dim=1)
+
+    def _verify_batched(
+        self, session: SpecSession, state: torch.Tensor, noise: torch.Tensor, x0_draft: torch.Tensor
+    ) -> torch.Tensor:
+        """All K timesteps in one ``predict_velocity`` at batch ``B*K``.
+
+        Row ordering is b-major, ``row = b*K + k``, and every conditioning tensor
+        below is expanded the same way so they stay aligned. Note the two layouts:
+        ``prefix_pad_masks`` is ``[B,S]`` but ``prefix_position_ids`` is
+        ``[3,B,S]`` -- mrope's three axes come first -- so the batch axis to
+        expand is 0 for one and 1 for the other.
+        """
+        batch, k = int(state.shape[0]), len(self.config.spec_t_list)
+        t = torch.as_tensor(self.config.spec_t_list, device=x0_draft.device, dtype=x0_draft.dtype)
+
+        # [B,K,H,D]: every timestep's x_t, built off the one draft.
+        x_t = build_x_t(noise[:, None], x0_draft[:, None], t[None, :, None, None])
+        v_t = self.transformer.predict_velocity(
+            state=_expand_rows(state, k),
+            prefix_pad_masks=_expand_rows(session.pad_masks, k),
+            prefix_position_ids=_expand_rows(session.position_ids, k, dim=1),
+            past_key_values=[
+                (_expand_rows(key, k), _expand_rows(value, k)) for key, value in session.past_key_values
+            ],
+            x_t=x_t.reshape(batch * k, *x_t.shape[2:]),
+            timestep=t[None, :].expand(batch, k).reshape(batch * k),
+        ).reshape(batch, k, *x_t.shape[2:])
+        return x0_from_velocity(x_t, t[None, :, None, None], v_t)
 
     def _refresh_draft(self, prefix_embs: torch.Tensor, state: torch.Tensor) -> torch.Tensor | None:
         if self.draft_failed:

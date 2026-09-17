@@ -399,9 +399,10 @@ KV staleness 归档待跑）。它仍然是最大的单项杠杆（`embed_prefix
 **"按维 RMS 误差 eps 的草稿，在阈值 tau 下能被接受 n 步"** —— 这就是 10.1 训练要达到的精度目标，
 而且是在训练**之前**就能知道。注意上面那条 fp16 噪声底：`tau ≲ 0.01` 的行不要当真。
 
-verify 采用**顺序执行 K 次** `predict_velocity`，不是 FLASH 的 `B*K` batch：
+verify 最初采用**顺序执行 K 次** `predict_velocity`，不是 FLASH 的 `B*K` batch，理由是
 `expand_past_key_values` 会把 42.2 MB 的 prefix KV 物化 K 份，而 F2 已证明这个循环本来就受权重带宽约束。
-K=2 时顺序成本是 2×21.3 ms，且不需要改 attention 路径；batch 版留作 10.2 的优化项去实测。
+**这个理由是错的，已在 §12.8 实测推翻**：受权重带宽约束恰恰是批量能摊销的条件，而 42.2 MB×K 的拷贝
+在 449 GB/s 上只有 ~1 ms。批量版已落地（`spec_verify_batched`，默认开）。
 
 #### 结果 — **通过**。6 个 chunk，fp16，`t_list=(0.10, 0.05)`，`eval_h=12`
 
@@ -989,3 +990,136 @@ python examples/offline_inference/lingbot_vla_v2/prepare_lingbot_vla_v2.py \
 * FLASH 的 `enable_gripper_verify`（any-K 预检停止）仍未移植，`spec_decode.py` 顶部已注明。
 * 服务端只跑过 `SpecDecoder` + `IGpuDraftClient`（生产对象）与 pipeline 分流的单测，
   **没有跑通完整的 OpenPI WebSocket 全链路投机**；那需要起 server + client，尚未做。
+
+### 12.8 批量 verify — `spec_verify_batched` — **已落地，已实测**
+
+§10.1 把 `B*K` 批量 verify 推给 §10.2 并给了一个估算。现在测了，
+`phase10_verify_batch_sweep.py` / `test_spec_verify_batch.sh`，
+dGPU（`ZE_AFFINITY_MASK=0`）、fp16、compiled、3 次交替重复、单步 = 22.6 ms：
+
+| K | M=51K | 顺序 | **批量** | vs 顺序 | **vs K=1** |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 51 | 22.8 ms | 22.8 ms | 1.00× | 1.00× |
+| 2 | 102 | 44.2 ms | **30.6 ms** | 1.44× | **1.34×** |
+| 4 | 204 | 86.9 ms | 46.8 ms | 1.85× | 2.05× |
+| 8 | 408 | 172.7 ms | 78.6 ms | 2.20× | 3.39× |
+| 10 | 510 | 215.8 ms | 90.5 ms | 2.38× | 3.90× |
+
+**结论：值得做，但"K=2 白拿"是错的。** 默认 K=2 上把每个投机轮的 verify
+从 44.2 降到 30.6 ms（−13.6 ms），这是实打实的；但它是 K=1 的 **1.34×**，
+不是我先前估的 ~1.0×。
+
+**估算错在哪，记下来免得再犯。** 那个估算只用了 F2 的 MoE GEMM 行
+（M=51→102 是 0.251→0.298 ms，即线性的 0.19×）就去推整步。但 MoE GEMM 只占
+一个 layer-step 的 **44%**（§PHASE9 §1）。剩下 56%——attention（含 prefix KV 的
+`cat`）、融合后的 q/k/v、norm/router——**不受权重带宽约束**，实测按线性的 **~0.78×**
+缩放。分解 K=2 的 +7.8 ms：MoE 侧按 F2 只该涨 36×0.047 = +1.7 ms，其余 +6.1 ms
+全在非 MoE 部分，与 0.2166 ms/layer-step × 0.78 × 36 = +6.1 ms 吻合。
+**不要把 F2 的 GEMM 数字当整步成本引用。**
+
+**K 不是可以随便加大的。** `radius_prefix_acceptance` 对 K 取 `min`（合取），
+每多一个 verify 时间步就是多一道否决权，接受率单调下降。K=10 即使批量后也要 90.5 ms
+（比 K=1 贵 68 ms），同时把接受率往下压——两头付钱。批量的价值是让 K=2 的稳健性
+（防某个近终点 t 恰好让错草稿看起来对）只花 1.34× 而不是 2×。
+
+想让接受率随 batch **上升**，方向是对 N 条候选草稿取 argmax（multi-draft），
+而不是对 K 取 min；那需要 10.1 训练多输出头，未做。
+
+落地细节：`predict_velocity` 是 `dynamic=False` 编译的，所以 B=1（full round 的
+Euler 循环）和 B=K（verify）是两份特化，两次 warmup、两张图；sweep 脚本据此抬高了
+dynamo 的 cache 上限。`prefix_position_ids` 是 `[3,B,S]` 而 `prefix_pad_masks` 是
+`[B,S]`，批量展开的轴不同，`test_spec_decode.py` 里有一条专门盯这个的对齐测试。
+
+### 12.9 每 tick 重新 grounding — `spec_reground` — **已落地，已实测，不做默认**
+
+§12.8 之前测的只是"批量 verify"这一条。完整的**新方案**是四条：
+
+```
+spec = _ground(新观测) + draft(新 embs) + 一次 B=K 的批量 verify
+     + (拒绝 → 同 tick 跑 10 步 denoise)
+```
+
+现在四条都落地了，藏在 `config.spec_reground` 后面（默认 off），并且
+`test_spec_oneccl.sh` 改成了 **scheme × K × 接受率** 的三轴 sweep：
+`cached`（今天出货的：复用上一个 full round 的 prefix KV，拒绝则把 full round 推给
+下一 tick）对 `reground`（上面四条）。两个方案谁赢完全是接受率的函数，所以是测出来的
+不是吵出来的。容器内、dGPU（`ZE_AFFINITY_MASK=0`）、fp16、compiled、
+`--worker-cpu 11`、`spec_full_every=4`、**每格 60 ticks**、baseline（完全不投机）
+292.6 ms。
+
+**先看每轮中位数，这些才是结构性的数字：**
+
+| 每轮 | K=1 | K=2 | K=4 |
+|---|---:|---:|---:|
+| full round（两方案共用） | 300.4 | 301.0 | 301.0 |
+| `cached` 投机轮 | 27.4 | 35.2 | 50.1 |
+| `reground` 接受轮 | 113.3 | 121.1 | 136.0 |
+| `reground` 拒绝轮 | 322.1 | 330.2 | 344.0 |
+
+两条差值把成本分解得很干净，也正好互相验证：
+
+* **接受轮 − `cached` 投机轮 = 85.9 ms，在 K=1/2/4 上完全不变。** 这就是
+  `_ground`（§11 的 80.8 ms）加上「refresh 比裸 draft 多的 ~5 ms」，与 K 无关是对的。
+* **拒绝轮 − full round = +21.7 / +29.2 / +43.0 ms**，分别约等于 §12.8 表里 K=1/2/4
+  的一次批量 verify（22.8 / 30.6 / 46.8）。也就是说，**`reground` 的拒绝轮就是一个
+  full round 外加一次白扔的 verify 和一次白扔的 draft**。
+
+**再看 per tick：**
+
+`cached`：
+
+| K | 0 | 0.25 | 0.5 | 0.75 | 0.9 | 1 | measured |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 165.3 | 141.1 | 118.0 | 99.5 | 85.9 | 82.8 | 164.7 |
+| 2 | 169.0 | 145.8 | 125.1 | 105.5 | 92.1 | 88.5 | 168.3 |
+| 4 | 177.7 | 154.8 | 133.8 | 116.9 | 104.1 | 99.8 | 175.8 |
+
+`reground`：
+
+| K | 0 | 0.25 | 0.5 | 0.75 | 0.9 | 1 | measured |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 352.3\* | 270.4 | 222.8 | 173.7 | 134.6 | 114.5 | 323.5 |
+| 2 | 330.5 | 279.1 | 229.9 | 181.7 | 142.1 | 123.0 | 330.4 |
+| 4 | 344.1 | 291.8 | 260.5\* | 195.6 | 156.7 | 136.9 | 344.0 |
+
+**结论：`reground` 在每一个格子都更慢，1.37×–1.96×**（把下面带 `*` 的两格按重建值
+算；照读 mean 的话上限是 2.13×，但那一格是瞬态），包括接受率 = 1 的格子
+（1.39×，因为每 tick 的 80.8 ms grounding 再也摊不掉了）。三个更尖锐的读法：
+
+1. **在今天真实的接受率（0，没有训练好的草稿头）下，`reground` 比"完全不投机"还慢**：
+   330.5 对 292.6。原因就是上面那条分解——每个 tick 都是一个 full round 外加白扔的
+   draft 和 verify。`reground` 要先追上不投机的 baseline，接受率大约得到 **0.2–0.25**
+   （K=1 在 0.25 是 270.4 已经赢，K=4 在 0.25 是 291.8 刚好打平）。
+2. **但 `cached` 便宜的那一端是拿动作质量买的，不是赢来的。** 它在接受率 0 时的
+   169.0 ms 就是 `(301.0 + 35.2) / 2`：一半的 tick 返回 `x0_tail`——一个
+   **刚刚被否掉的**草稿上做一步近终点估计，而且否它的 teacher 读的还是上一帧。
+   `reground` 两件事都不干。所以这两栏不是"同一个 decode 的两个价格"，
+   1.96× 是那两条保证的价钱，值不值只有闭环能回答（探针 2 更便宜，仍未跑）。
+3. **K 在 `reground` 里相对更便宜**，因为它是加在更大基数上的固定加项：接受率 = 1 时
+   K=1→4 是 113.3→136.0（1.20×），`cached` 同区间是 26.5→49.4（1.86×），
+   verify 本身是 2.05×。这不改变 §12.8 的结论——K 取 `min` 是合取，加大 K 会压低
+   **真实**接受率，而强制接受率的 sweep 结构上测不出这一点。
+
+**两个必须记下来的测量假象，别在下一轮被它们骗到。**
+
+* **`--ticks 20` 会让强制接受率非单调。** `_force_accept` 以 20 为一块洗牌，
+  20 ticks 就只有一块，于是"被强制拒绝的 tick 恰好落在周期性 full round 本来就要跑的
+  位置上"纯靠运气。20 ticks 的那一轮里 0.75 全线比 0.5 还快（三个 K 都是），
+  换成 60 ticks 后每一行都恢复单调。这跟 `_force_accept` 自己 docstring 里记的
+  Bresenham 变体的假象是同一类。**跑这个 sweep 不要低于 60 ticks。**
+* 表里带 `*` 的两格，mean 和"用每轮中位数重建的 per-tick"不一致：
+  `reground K=1 @ 0` 读到 352.3 而重建值是 322.1（它自己的 `measured` 列是 323.5，
+  所以诚实值是 ~322，352.3 是首个 arm 的一次瞬态），`reground K=4 @ 0.5` 读到 260.5
+  而重建值是 243.4。sweep 现在固定输出 `per_tick_ms_from_medians` 这一列专门做这个
+  交叉检查，就是它抓出来的。
+
+落地细节：`_full_round` 拆成了 `_ground` / `_denoise` / `_adopt`，两个方案共用
+贵的那一半；`reground` 的 draft worker 死亡路径把已经建好的 grounding 交给
+`_full_round`，不会付两次 80.8 ms。同 tick 的 denoise 兜底只在
+**`accepted_len == 0`** 时触发：夹爪守卫截断出来的非空接受里剩下的是真·被接受的
+草稿步，没有 staleness 需要 full round 去修。`spec_reground` 打开后
+`spec_full_every` 和 `pending_full` 一起失效（`_wants_full` 直接短路），
+每个 session 只剩一个 full round 用来把 prefix 建起来。sweep 里
+`regrounded_rounds` 是道明确的引线：如果 `--scheme reground` 的一列报 0，
+说明 config 开关没走到 decoder，那一整列是同一个方案测了两遍。
+
