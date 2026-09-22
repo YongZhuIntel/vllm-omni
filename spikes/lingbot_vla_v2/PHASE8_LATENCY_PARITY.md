@@ -2606,6 +2606,164 @@ sweep and 9x cheaper than a converged one. The two schemes are not variants of
 each other — in flow matching the intermediate `x_t` are scaffolding, not
 outputs, and ParaDiGMS pays to get them right.
 
+## N. Ring attention across both cards — built, measured, rejected, 2026-09-22
+
+The seventh dual-device arrangement, and the first whose kernel was actually
+built and validated rather than priced. Full results in
+**`PHASE14_RING_ATTENTION.md`**; what this section owes the reader is the
+numbers that change something above.
+
+Both topologies were run on both cards, eager, same-process comparands (the
+compiled-path economics for the context split are at the end of this section,
+and they are the ones that matter for a shipping config):
+
+| | dGPU alone | dGPU + iGPU | |
+|---|---:|---:|---|
+| context parallel — prefix KV split 143/143, queries replicated | 454.6 ms | 1124–1207 ms | **0.38–0.40x** |
+| sequence parallel — the 51 suffix rows split 26/25 | 448.6 ms | 2434–2460 ms | **0.18–0.19x** |
+
+The ring kernel is correct: **one fp16 ulp** from `eager_attention` at 1, 2, 4
+and 8 shards, its merge agrees with the shipped
+`ring/ring_utils.update_out_and_lse` to 1.8e-7, and the sequence-parallel action
+chunk lands at rms **1.202e-3**, *below* the 3.9e-3 fp16 floor. The scheme does
+not fail on numerics.
+
+Six things here amend this document:
+
+1. **The 286-token prefix KV is worth 33–35 ms of the compiled loop — 17% — and
+   it is only 1.6% of the bytes.** Measured without any ablation, by truncating
+   the prefix KV cache and timing the whole loop: compiled 206.3 ms at 286 keys,
+   181.7 at 143 (**−24.6 ms, −11.9%**), 171.2 at 8. §F2 decomposed the layer-step
+   but never isolated attention, and the byte ratio makes it look negligible —
+   1.12 MiB of prefix KV against 72.0 MiB of expert weights per layer-step. The
+   resolution is efficiency, not volume: the bytes saved by halving the KV come
+   out at **8.6 GB/s** against the loop's own **183 GB/s** effective (§M.6), i.e.
+   **21x less efficient than the loop average**, because it is a `[286, 8, 128]`
+   read feeding an M=51 GEMM. So "the loop is memory-bound" is about the expert
+   weights (98.4% of the bytes), and anyone pricing an attention-side change —
+   fmha, flash-suffix, a better SDPA backend — should use the 33–35 ms, not the
+   byte share. Step C's remaining upside (§F1) is unchanged.
+
+   The eager path reads the opposite way and must not be extrapolated from: eager
+   is **flat** in prefix length (452.1 ms at 286 keys, 452.1 at 8), because it is
+   launch-bound. Inductor fuses the launches away and the work reappears. The
+   shipped config is `compile_denoise_step=True`.
+
+2. **Where the compiled 206 ms loop's time goes, measured three ways.** §F2
+   decomposed a layer-step but the pieces were never priced against the loop.
+   Byte budget first, exact from the config, fp16, per layer-step: routed
+   experts **72.00 MiB (81.7%)**, fused q/k/v **9.00 MiB (10.2%)**, `o_proj`
+   6.00 MiB (6.8%), prefix KV read 1.12 MiB (1.3%). Then time:
+
+   | | ms | of 206 | method |
+   |---|---:|---:|---|
+   | the 286-token prefix's attention | 33–35 | 17% | truncate the prefix KV, time the whole loop |
+   | everything that scales with the 51 suffix rows | ≤ 20 | ≤ 10% | compiled row sweep, 50 → 1 rows: 196.1 → 176.3 ms |
+   | MoE GEMM | ~90 | ~44% | §F2's 0.251 ms/layer-step x 360 |
+   | remainder (router, shared expert, norms, mrope, residuals, submit) | ~60 | ~29% | subtraction |
+
+   The three come from different code paths (the row sweep runs a reimplemented
+   forward that compiles 5% *faster* than the shipped one, 196.1 vs 206.2) so
+   they should not be summed precisely. The ordering is what matters, and it
+   settles a question worth recording: **the suffix's own work — including the
+   fused q/k/v that rebuilds all 51 rows' K/V every layer-step — is at most 10%
+   of the loop, and it saturates by 25 rows.** Note also that the suffix K/V is
+   never cached: `predict_velocity` passes `fill_kv_cache=False`, so `:1168`
+   concatenates freshly-computed suffix K/V onto the 286-token prefix cache 360
+   times per request. Only the prefix is a cache.
+
+3. **§G5's bound was loose by 30x, in the direction that strengthens it.** §G5
+   priced row splitting at "at most ~13%" from the MoE GEMM's M-sweep. Measured
+   over the whole forward, with a same-code-path 51-row control to subtract the
+   probe's own overhead, halving the rows buys **+0.4%** (507.6 -> 505.7 ms).
+   The reason is §F1's, not §G5's: the loop is dispatch-bound, and halving the
+   rows removes no operator at all. So the sequence split hands away half its
+   work and keeps ~100% of its cost *before* any communication and *before* the
+   iGPU runs anything. Any scheme whose saving comes from fewer suffix rows per
+   forward is dead on arrival, second device or not.
+
+4. **Both splits are iGPU-compute-bound, not communication-bound — which is the
+   opposite of what §G and §M.6 framed this class of scheme as.** Those sections
+   rejected dual-device arrangements on "720 per-layer collectives" and on a
+   0.155 ms round trip. Built and measured, the collectives are the *small* term:
+
+   | per layer-step | iGPU compute | wire |
+   |---|---:|---:|
+   | context parallel, 1.652 ms exchange | **1.309 ms** | 0.460 ms |
+   | sequence parallel, 5.34–5.40 ms blocked | **5.304 ms** | 0.107 ms |
+
+   Both columns are measured directly — the iGPU figures self-reported from
+   inside the iGPU process, the wire from an echo-only arm (`--split wire`) whose
+   worker loads no weights and runs no kernels. Over the loop the wire is
+   **165 ms** (context) and **39 ms** (sequence) against the iGPU's **467 ms**
+   and **1910 ms**, so making the wire free leaves both splits losing. The wall
+   is still §K2's `k` — the iGPU's 29 GB/s — and the per-layer collective count
+   is not what to argue about next time. (§M.6's 0.155 ms is still
+   payload-specific: the curve is 0.126 ms + 0.56 ms/MiB, so 1.46 MiB costs 5.6x
+   what 76.5 KiB does. Price the next topology at its own size, and with an
+   echo-only control rather than a residual — PHASE14 got two different answers
+   2.6x apart before it built one.) Relatedly, **shm beats oneCCL above ~300 KiB
+   on this host** (setup 16.9 vs 524.0 ms at 20.1 MiB, wire 0.460 vs 0.546 ms);
+   PHASE10 §9's equality holds at 293 KiB and does not extend upward.
+
+5. **Splitting one fused attention into N blocks costs N kernel launches, and on
+   this dispatch-bound loop that is the dominant term on the dGPU side too.**
+   `eager_attention` over all 337 keys is 131 µs; the probe's ring is 310 µs at
+   one shard, 684 at two, 1386 at four — ~340 µs per shard regardless of shard
+   size, and *independent of whether the merge runs in fp32* (fp32 and
+   input-dtype accumulation differ by 1.5%). So the fp32 merge that keeps the
+   ring on the fp16 ulp floor is free, and the cost is launch count: the
+   context-parallel arm's dGPU side got **216 ms slower** with both blocks still
+   on the dGPU and not a byte on the wire. Anyone landing ring attention on this
+   stack should write a fused kernel that emits `out` and `lse` in one launch
+   before splitting anything.
+
+6. **Load balancing does not rescue it, and the reason is worth keeping: the
+   iGPU's cost does not shrink with its share.** Sweeping the share on both
+   cards (`--arm share-sweep`), the dGPU is flat in *both* dimensions — 1 prefix
+   key costs what 286 do (299 vs 301 µs), 1 action row costs what 50 do (508 vs
+   514 ms) — because at these shapes attention is **launch-bound, not
+   work-bound**. The iGPU's row curve saturates too, at **1704 ms** for a single
+   row, because sequence parallelism *replicates the weights*: a rank holding one
+   row still streams all 36 layers' 2.72 GB per step, 27.2 GB per request, and
+   27.2 GB / 29 GB/s = 937 ms is an arithmetic floor 4.4x above the 213.5 ms
+   target. So any arrangement that requires the iGPU to hold all 36 layers is
+   capped at 8x the target regardless of share or kernel quality; the only
+   direction that reduces the iGPU's *bytes* is splitting by layer (PHASE13 §5c
+   priced that), not by row or by key. Fusion is not the missing piece either:
+   `sdpa_attention` is 0.90x `eager_attention` at this shape, and a perfectly
+   fused ring at two shards is still two launches.
+
+   Two corrections PHASE14 made to itself along the way, both worth knowing
+   because they are the kind this document has made before: it first priced the
+   wire from a timing span that contained the dGPU's own attention (§8 ③), and it
+   first concluded "splitting the key axis divides work that is not the cost"
+   from **eager** curves and a microbenchmark, both launch-bound, without
+   re-measuring on the compiled path that actually ships (§8 ⑤). The direction
+   survived both; the attribution and the magnitudes did not.
+
+§K's rule is unaltered, and §14's numbers are another instance of it: the iGPU's
+half of the sequence split is the critical path by 3.7x, and with a *free* wire
+and *perfect* overlap the wall only moves from 0.19x to 0.24x.
+
+Restated on the compiled path, which is what a shipping config runs, the context
+split's account is three measured terms:
+
+| | ms |
+|---|---:|
+| compiled loop, one card | 206.3 |
+| **benefit** — dGPU side, 50/50 KV split | **−24.6** |
+| benefit ceiling — hand over nearly all the prefix KV | −35 |
+| **cost 1** — the wire, 1.2 MB round trip x 360, shm, echo-only measurement | **+158** |
+| **cost 2** — the iGPU's attention block, 143 keys x 360 | **+467** |
+
+**The wire alone is 6.4x the benefit**, before the iGPU computes anything, and
+the payload does not shrink with the share — `query` and `reply` are sized by the
+query and output shapes, not by the KV split. That is the condition to watch if
+this is ever revisited: the benefit grows with context length, the payload does
+not, so a model in this family with a prefix an order of magnitude longer would
+move the ratio. At 286 tokens it is not close.
+
 ## Rules
 
 Phase 5 and 6 rules carry over. Two that this phase will be tempted to break:
