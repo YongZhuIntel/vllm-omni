@@ -1968,7 +1968,7 @@ What the penalty is not:
 | the dGPU itself slows | read bandwidth, 4096² matmul, MoE layer-step at the real shape, iGPU busy | **448 GB/s vs 449, 1.46 vs 1.46 ms, 0.249 vs 0.251 ms — untouched** |
 | kernel submission is serialised in the driver | 20k tiny dGPU kernels, unsynced | 5.19 vs 5.22 µs — **no change** |
 | package power / CPU frequency | RAPL, and a pinned CPU-frequency proxy | 128² costs **18.4 W and is free**; 2048² costs 22.4 W and is ruinous. Pinned proxy +4% |
-| LLC / working-set pollution | 24.0 MiB vs 1.5 MiB vs 0.1 MiB iGPU working sets | 24 MiB **511.0**, 1.5 MiB **515.7** — footprint is irrelevant |
+| LLC / working-set pollution | 24.0 MiB vs 1.5 MiB vs 0.1 MiB iGPU working sets | 24 MiB **511.0**, 1.5 MiB **515.7** — footprint is irrelevant *(to the **contention** mechanism. It is not irrelevant to the iGPU's own throughput: §L measures a 10.5x cliff at its 16 MiB cache.)* |
 | CPU core placement (the F6 mechanism) | load pinned to the LPE island; victim pinned to P-cores | load off the P-cores still costs 464.3; victim pinned as well, 444.5 |
 | host DRAM bandwidth | iGPU streaming at 29 GB/s continuously | +10.8 ms (3.7%) |
 
@@ -2006,6 +2006,13 @@ not pin the server without also pinning everything else.
 > it concurrently with the request.**
 
 That rule, not a partition of the model, is what makes the iGPU usable here.
+
+§L adds the other half of it, which this section could not see because it only
+ever varied *occupancy*: a **working-set budget of 16 MiB**, the iGPU's cache.
+Inside it the iGPU is as fast as the B60 (`k` ≈ 1); outside it the iGPU is
+memory-bound by 9.3x and `k` is 12-13x. So the full rule is *short kernels, and
+a working set under 16 MiB* — which is exactly the shape of Phase 10's 4.4 MiB
+draft head, and exactly not the shape of a 3.91 GB/step denoise loop.
 
 ### K1. The fixed-function media engine — the best available use
 
@@ -2089,6 +2096,17 @@ measurements in this section make each of them worse rather than better: `k` is
 iGPU work taxes the request by ~1.75x — which is larger than the entire
 ceiling it was trying to win.
 
+**§L restates the ground of this rejection, and the restatement is stronger.**
+`k` = 12.9x is the symptom; the cause is that the iGPU's machine balance is
+**472 FLOP/byte** against the workload's `AI = M = 51`, so it is memory-bound by
+9.3x where the B60 is memory-bound by 4.1x — and it already runs at 81% of its
+own memory roofline, so there is no implementation slack to recover. Stated that
+way the rejection survives the obvious follow-up (make the working set
+cache-resident and the bandwidth stops mattering): §L measures that the iGPU's
+16 MiB cache really is worth up to 10.5x, and that the loop still cannot use it,
+because tiling creates no reuse and the only reuse present — 10 steps over the
+same 3.91 GB — is locked by the steps' sequential dependence.
+
 ### Summary
 
 | direction | uses the iGPU | effect on the request | status |
@@ -2098,12 +2116,495 @@ ceiling it was trying to win.
 | K2 auxiliary lower-rate models | EU array, scheduled into the idle window | none if scheduled, ~+220 ms if not | the real opportunity; needs G3 first |
 | K3 offline eval second replica | EU array, saturating | ~+220 ms on the other replica | rejected, our own numbers |
 | K4 split the model path | EU array, concurrent | ~+220 ms against a <8% ceiling | closed |
+| L denoise on the iGPU, made cache-resident | EU array + its 16 MiB cache | ~1150 ms of MoE vs the dGPU's 98 | closed on **reuse**, not on `k` — see §L |
+| M split a ParaDiGMS sweep across both cards | EU array, concurrent | contention only **1.01x**, but one point costs 233 ms vs the dGPU's 153 for ten | closed on **granularity** — see §M |
+| M6 shard the MoE experts for aggregate bandwidth | its LPDDR5 share, concurrent | 360 round trips x 0.155 ms = 55.8 ms to buy **at most** 12.9 ms | closed on **transport** — see §M §6 |
+
+The `~+220 ms` in the K2/K3/K4 rows is the 1.74–1.76x contention tax measured
+below with a 2048² matmul. **§M §4 finds it does not apply to a memory-bound
+iGPU workload** — real denoise on the iGPU taxes the dGPU 1.01x — so for any
+such workload those rows overstate the cost. None of the three rejections turns
+over on it; the reasons are restated in §M §4.
 
 Unmeasured, and worth measuring if K1 or K2 is pursued: whether the media blocks
 also spend package power at a rate that costs CPU frequency (the duty-cycle and 128² rows suggest
 that whatever the mechanism is, bursts and short kernels are safe); the iGPU's ViT `k`, still borrowed at 4.81;
 and whether a *scheduled* iGPU window really is as free as the 3%-duty row
 implies when the work is 200 ms long instead of 10 ms.
+
+## L. Cache residency on the iGPU — the mechanism is real, the loop cannot use it, 2026-09-17
+
+Asked whether denoise could run on the iGPU after all, by keeping the working
+set in its caches or walking it in tiles small enough to beat the 29 GB/s DRAM
+wall §K measured. The premise is sound in a way §K did not anticipate — the
+iGPU's own cache is worth up to **10.5x** and reaches **265 GB/s** — and the
+denoise loop still cannot collect a single millisecond of it. The reason is not
+bandwidth and not footprint; it is that the loop contains no reuse to hold.
+
+Probe: `phase11_igpu_cache_residency_probe.py`, one process per device
+(§K1). Container `test-image_zy_scaler0260b2_lingbot_omni`, torch 2.12.0+xpu —
+**not** the 2.10 the rest of this document used, so absolute ms here are not
+comparable with §F; the ratios and the roofline placements are.
+
+### 1. The iGPU's hierarchy, and the machine balance that follows
+
+| level | iGPU | B60 dGPU |
+|---|---|---|
+| device | Intel Graphics `0xB08F` (Xe3, Core Ultra 5 338H) | Arc Pro B60 |
+| EU / subslices | 80 / 10 | 160 / 20 |
+| GPU-side cache | **16 MiB** | 18 MiB |
+| SLM per work-group | 128 KiB | 128 KiB |
+| memory | 56.4 GiB **shared** LPDDR5, 64-bit | 22.71 GiB GDDR6 |
+| measured fp16 GEMM ceiling | 13.7 TFLOPS | 93.2 TFLOPS |
+| measured stream read | 29 GB/s | 449 GB/s |
+| **machine balance** | **472 FLOP/byte** | 208 FLOP/byte |
+
+The dGPU column reproduces F2 exactly (93.1 TFLOPS, 449 GB/s, balance 207), so
+the method is the same one F2 used.
+
+This table is the whole answer to "why is the iGPU bad at denoise", and it is a
+better answer than §K2's `k`. F2 established the workload's arithmetic intensity
+is `AI = M = 51` — each weight element, once fetched, serves all 51 token rows,
+2·51 FLOP per 2 bytes. Against the two balances:
+
+| device | balance | AI | memory-bound by | layer-step measured | vs its own memory roofline |
+|---|---:|---:|---:|---:|---:|
+| B60 dGPU | 208 | 51 | **4.1x** | 0.272 ms | 62% |
+| iGPU | 472 | 51 | **9.3x** | 3.193 ms | **81%** |
+
+So the iGPU is not *worse implemented* — it runs closer to its own roofline than
+the dGPU does. It is **more** memory-bound, by 2.3x, because its balance point is
+472 rather than 208. Moving a memory-bound workload there moves it onto a
+15.4x narrower memory path and makes the imbalance worse. `x360` projects
+**1150 ms** of denoise-loop MoE against the dGPU's 98 ms, which independently
+reproduces §K2's borrowed 1168.5 ms.
+
+**This replaces §K4's reasoning.** §K4 rejects the model path because `k` is
+12.9-15.4x. That is the symptom. The cause is that the iGPU's machine balance is
+472 FLOP/byte and the workload offers 51.
+
+### 2. The cache cliff is real, and it lands exactly on 16 MiB
+
+A single `x.sum()` streams the buffer once, so it is a cold DRAM read at every
+footprint — which is why `phase8_bandwidth_probe.py` reads 29 GB/s from 4 MB to
+2.7 GB and why the cache is invisible to it. Reuse has to happen *inside one
+launch*: `x[None].expand(R, n).sum()` reads the same bytes R times, holding
+total bytes read constant so launch cost amortises equally.
+
+| footprint | 0.5 | 4 | 8 | 12 | 16 | 20 | 24 | 32 | 64 | 256 MiB | stream |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| iGPU GB/s | 117 | 115 | 112 | 88 | **107** | 28 | 26 | 99 | 86 | 43 | **29** |
+| dGPU GB/s | 336 | 336 | 335 | 292 | 290 | 234 | 209 | 318 | 298 | 172 | **449** |
+
+The ≤16 MiB plateau and the 29 GB/s floor are solid — 117 vs 29 GB/s is a **4x**
+prize, and it reproduced in three runs. **Beyond 16 MiB this particular probe is
+not monotonic** (32 MiB reads 99 GB/s, above 20-24 MiB's 26-28), on both
+devices, so the reduction kernel's blocking is evidently changing with `R` and
+shape rather than the cache alone explaining every cell. Do not read a clean
+cliff out of this table; it establishes that a plateau and a floor exist and
+roughly how far apart they are. The load-bearing cliff evidence is §3 below,
+which uses the real MoE shape and *is* monotonic.
+
+### 3. At the real MoE shape, residency is worth up to 10.5x — on the iGPU only
+
+The decisive measurement. M=51, expert count swept so the weight footprint
+crosses 16 MiB. `cold` rotates a weight pool far larger than the cache (the
+loop's real reuse distance is 3.91 GB, so every layer-step is a cold read);
+`hot` reuses one buffer, the unreachable best case for any blocking scheme.
+
+**40 steps run back-to-back per timed region.** This is not a detail: timing one
+step per sync makes the three `bmm` launches (0.062 ms each on the iGPU)
+dominate at small E, which floors `cold` and `hot` at the same value and hides
+the effect completely. A first pass at this measurement did exactly that,
+reported 1.01x at every footprint, and concluded the cache was useless. It was
+measuring launch overhead.
+
+iGPU, one run, all rows from the same process:
+
+| E | weights | fits 16 MiB | cold ms | hot ms | gain | cold GB/s | hot GB/s |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 2 | 4.7 MB | yes | 0.1827 | 0.0470 | **3.9x** | 25.8 | 100 |
+| 4 | 9.4 MB | yes | 0.3677 | 0.0502 | **7.3x** | 25.7 | 188 |
+| 6 | 14.2 MB | yes | 0.5608 | 0.0534 | **10.5x** | 25.2 | **265** |
+| 8 | 18.9 MB | **no** | 0.7859 | 0.6020 | 1.3x | 24.0 | 31 |
+| 12 | 28.3 MB | no | 1.0680 | 1.0677 | 1.00x | 26.5 | 27 |
+| 32 | 75.5 MB | no | 3.1687 | 3.1529 | 1.01x | 23.7 | 24 |
+
+`cold` sits at 24-30 GB/s at every footprint — it is the 29 GB/s DRAM path,
+confirming the pool really does defeat the cache. `hot` crosses the cliff
+between 14.2 and 18.9 MB, i.e. at the reported 16 MiB.
+
+dGPU, same probe: **1.01-1.02x wherever the footprint fits its 18 MiB L2, and at
+most 1.19x anywhere** (1.19x at E=8, 1.07x at E=12). Its cold path is already
+91-311 GB/s, so the L2 has almost nothing to add — the entire asymmetry between
+the two devices is that 29 GB/s leaves a 9x gap for a cache to close and
+449 GB/s does not.
+
+Two consequences. First, `hot` at E=2..6 is flat at 0.047-0.053 ms — inside the
+cache the layer-step stops being memory-bound at all and becomes launch-floor
+bound, which is why the gain keeps growing with E while the footprint still
+fits. Second, and more useful: at E=6 the iGPU's hot time is 0.0534 ms against
+the dGPU's 0.0527 ms for the same work. **Inside the cache, `k` ≈ 1.01.** That
+is the quantitative version of §K's "short bursts are free", and it explains
+Phase 10's narrow draft head (4.4 MiB, `k` = 2.25x) far better than §K's rule
+did.
+
+Across four runs the E=6 hot cell read 0.0521 / 0.0523 / 0.0534 ms and one
+outlier at 0.1323, and the gain read 9.6 / 9.6 / 10.5 / 3.8x. So the plateau is
+reproducible and the `k` ≈ 1 reading is sound, but on a loaded host one run in
+four lands 2.5x off. Re-measure on an idle host before quoting a calibrated
+ratio; "iGPU ≈ dGPU inside the cache" is what the data supports.
+
+### 4. Why the denoise loop still gets none of it
+
+Two independent blockers, and the second is the one that matters.
+
+**Footprint.** 16 MiB holds **6 of 32 experts** at fp16. One layer-step needs
+75.5 MB of routed experts (108.7 MB with attention, shared expert and norms),
+one denoise step 3.91 GB — **4.5x, 6.5x and 233x** the 16 MiB cache
+respectively. Quantizing does not rescue it: all 32 experts at int4 are 18.9 MB,
+which is the E=8 row, the first one *past* the cliff (1.3x, 31 GB/s); int8 is
+37.8 MB, twice past it.
+
+**No reuse to capture — decisive.** Tiling the 32 experts into groups of 6 does
+not help, because splitting creates no reuse: the group is read from DRAM once
+either way and total traffic is unchanged at 75.5 MB. Cache residency only pays
+when data that was kept is read *again*. The reuse that exists in the loop is
+that all 10 denoise steps read the same 3.91 GB — 39.1 GB that could in
+principle be 3.91 GB, a 10x saving — and it is unreachable because the steps are
+sequentially dependent: `x_{t+1}` needs the complete 36-layer forward of `x_t`,
+so the loop cannot be reordered to `for layer: for step:`. F2 said the same
+thing about the dGPU's 18 MiB L2 ("the next denoise step re-fetches all 2.7 GB
+because there is nowhere to keep it"); §L is that argument re-run against a
+cache that turns out to be fast, with the same outcome.
+
+And if both blockers vanished, the arithmetic from §G2 still applies: the iGPU
+contributes 29 GB/s to a 449 GB/s system, **+6.5%**, against §K's measured
+1.75x concurrency tax.
+
+### 5. What this does change
+
+| claim | before | after |
+|---|---|---|
+| why the iGPU cannot host the model path | `k` = 12.9-15.4x (§K2, §K4) | its machine balance is 472 FLOP/byte against AI = 51 — memory-bound by 9.3x, vs the dGPU's 4.1x |
+| iGPU footprint sensitivity | "footprint is irrelevant" (§K3 table) | true of the *contention* mechanism only; the iGPU's **own** throughput has a 10.5x cliff at 16 MiB |
+| the budget for iGPU work | "brief bursts, or kernels short enough that the device idles" (§K rule) | same, **plus a working-set budget: ≤ 16 MiB, where `k` ≈ 1** |
+| denoise on the iGPU | closed on `k` | closed on reuse, which is the stronger argument: no restructuring, quantization or tiling opens it |
+
+Nothing in the Steps table moves. Step H is still the lever, for the reason F2
+gave and §L now gives a second time from the other device: bytes are the only
+free variable, because AI = `M` and `M` = 51 is fixed by the action chunk.
+
+### 6. Caveat on absolute numbers
+
+`vllm_graph_debug` held 100-200% CPU throughout, and the iGPU shares LPDDR5 with
+the CPU, so its absolute throughput swung **2.4x** across runs (GEMM ceiling
+6.65-13.8 TFLOPS, layer-step 3.19-8.15 ms, machine balance 472-476 in the runs
+where the ceiling was not depressed). Rule #2 applies: the ms in this section
+want a re-run on an idle host — `--json` is there for that, and no json is
+committed because the ones taken here are contaminated. The conclusions do not
+depend on the absolutes: the hot/cold ratios, the 16 MiB cliff and both roofline
+placements reproduced under both host states, and the dGPU column reproduces
+F2's committed numbers.
+
+This is itself a small finding in §K's direction: the iGPU's bandwidth is not
+merely 15.4x lower, it is *contended by the host CPU*. §K measured the iGPU
+taxing the dGPU; this is the same coupling in reverse.
+
+## M. ParaDiGMS — parallel sampling, on one card and on two, 2026-09-20
+
+Asked whether the ten sequential Euler steps could be removed by **ParaDiGMS**
+(Shih et al., *Parallel Sampling of Diffusion Models*) instead of by Phase 10's
+speculative round, and whether the P parallel points could then be **split
+across the iGPU and the dGPU**.
+
+Answer: **no, three times over, and none of the three "no"s is the one §K/§L
+predicted.** Picard needs 9 sweeps where 2.19 is break-even, so it loses on the
+dGPU alone before the second card is considered (§2); the iGPU's cost for **one**
+point exceeds the dGPU's cost for **all ten**, so no split avoids making the iGPU
+the critical path (§3); and the follow-up question — split the *bytes* instead of
+the points, since the loop is memory-bound — costs 55.8 ms of transport to buy
+at most 12.9 ms of bandwidth, and the iGPU's cache cannot rescue it because the
+loss is on the wire (§6). The contention tax that was expected to decide all of
+this turns out to be **1.01x** and decides nothing (§4).
+
+Probe: `phase12_paradigms_probe.py`, three arms, `test_paradigms.sh` to run them;
+§6 adds a payload to `phase10_ipc_probe.py`. Host `load1 = 0.16–0.82` throughout,
+both idle blocks agreeing to 0.1% (Rules #2).
+
+### 1. The scheme, and why the sweep count is the whole question
+
+With `x_0` fixed at the noise and `dt = -1/P`, Picard iteration on the Euler flow is
+
+    x_{j+1}^{m+1} = x_0 + dt * sum_{i<=j} v(x_i^m, t_i)
+
+Every `v` in a sweep is independent, so one sweep is one batched forward at B=P.
+Sweep m leaves `x_0..x_m` exactly equal to the sequential solution — a proof by
+induction on j, and the probe's self-check, which held at 2.2–6.4e-4 for every
+m < P across all runs.
+
+So P sweeps always converge, and the cost is `sweeps x 97.5 ms` against the
+loop's 213.8 ms. **Break-even is 2.19 sweeps**, measured, compiled, on the real
+model. The scheme has to converge in two.
+
+### 2. It converges in nine — arm `picard`, dGPU, compiled
+
+| sweep | `delta_rms` | `final_rms` vs shipped |
+|---:|---:|---:|
+| 1 | — | 4.106e-01 |
+| 2 | 5.498e-01 | 3.662e-01 |
+| 3 | 4.153e-01 | 1.534e-01 |
+| 4 | 2.092e-01 | 9.696e-02 |
+| 5 | 1.184e-01 | 2.671e-02 |
+| 6 | 2.952e-02 | 4.962e-03 |
+| 7 | 5.232e-03 | 8.989e-04 |
+| 8 | 1.370e-02 | 1.318e-02 |
+| 9 | **3.872e-04** | 1.318e-02 |
+| 10 | 1.948e-04 | 1.319e-02 |
+
+| | |
+|---|---|
+| one Picard sweep, B=10 batched | **97.47 ms** |
+| ten sequential Euler steps | **213.81 ms** |
+| break-even | 2.19 sweeps |
+| sweeps to converge (`delta_rms` <= 3.9e-3) | **9** → 877 ms, **0.24x** |
+| sweeps to land within `spec_tau` of shipped | 4 → 390 ms, **0.55x** |
+| converged answer vs shipped trajectory | 1.318e-2, inside `spec_tau` = 0.15 |
+
+The 97.47 ms reproduces `config.spec_verify_batched`'s committed 90.5 ms for
+batched K=10 to 8%, and the 213.81 ms reproduces §11's 213.5 ms exactly, so the
+arm is calibrated against numbers already on file.
+
+**There is no sweep count at which it wins.** Break-even is 2.19 and sweep 2 is
+still at 3.66e-1, 2.4x outside `spec_tau`; sweep 3 is 1.53e-1, still outside, and
+already costs 292 ms against 214.
+
+Accuracy is *not* the objection: the converged answer sits 1.3e-2 from the
+shipped trajectory, well inside the accept radius Phase 10 ships. ParaDiGMS is
+numerically fine here and simply too slow.
+
+#### The convergence criterion, and two wrong ones before it
+
+Worth recording, because both wrong instruments looked plausible and both
+produced a *lower* sweep count — i.e. they flattered the scheme:
+
+* **Scored against the shipped fp16 Euler answer**, the error falls to 8.989e-4
+  at sweep 7 and then *rises* to 1.318e-2 and sits there. Read as convergence,
+  that gives 7 sweeps. It is the iterate passing near the Euler answer on its way
+  to its own fixed point.
+* **Scored against one sweep taken off the exact trajectory** — an attempt to
+  construct the fixed point directly — gives 1.011e-3, which is not the fixed
+  point either. Picard's iterates are fp16 points reached by an fp32 prefix sum;
+  the Euler loop's are fp16 points reached by step-by-step fp16 addition. The two
+  self-consistent solutions genuinely differ, and 1.3e-2 is that difference.
+* **`delta_rms`, the distance between successive iterates**, needs no reference
+  at all and is the standard criterion for a fixed-point iteration. It gives 9.
+
+The bump at sweep 8 in both columns is the same event seen twice: the iterate
+leaving the neighbourhood of the Euler answer.
+
+### 3. The iGPU cannot take one of the ten — arm `step-cost`
+
+Eager `predict_velocity` on the real model, once per card (§K1: one Level-Zero
+platform per process, so this is two runs, not two devices in one).
+
+| B | dGPU | iGPU | `k` |
+|---:|---:|---:|---:|
+| 1 | 49.09 ms | 233.18 ms | 4.75x |
+| 2 | 49.83 ms | 350.19 ms | 7.03x |
+| 4 | 72.48 ms | 753.67 ms | 10.40x |
+| 10 | 153.51 ms | — | — |
+
+Two readings, and the second is the one that closes the split:
+
+1. **`k` grows with B: 4.75x → 7.03x → 10.40x.** The dGPU batches B=1→B=2 for
+   almost nothing (49.09 → 49.83) because at `M = 51` it is memory-bound by 4.1x
+   and has compute slack to spend; the iGPU pays +50% for the same step because
+   it is memory-bound by 9.3x and already at 81% of its own roofline (§L §1).
+   **ParaDiGMS is a batching scheme, so the iGPU is worst exactly where the
+   scheme needs it to be good.** §K's single `k` = 12.9–15.4x hid this; `k` is a
+   function of B.
+2. **One point on the iGPU costs 233.18 ms; all ten on the dGPU cost 153.51 ms.**
+   Same arm, same precision, same eagerness. A split sweep's wall clock is
+   `max(dGPU(n_d), iGPU(n_i))`, so any `n_i >= 1` puts the iGPU on the critical
+   path at **1.52x** the cost of not using it at all — 2.39x against the compiled
+   dGPU's 97.5 ms. The optimal split is `n_i = 0`.
+
+That is a stronger statement than §L's, and it is arithmetic rather than a
+roofline argument: the iGPU's *granularity* is too coarse. There is nothing to
+tune, because the smallest share it can take is one point and one point is
+already over budget.
+
+### 4. The contention tax is 1.01x, not 1.75x — arm `contention`
+
+The measurement that was expected to decide this, and does not.
+
+| dGPU B=10 sweep, compiled | |
+|---|---|
+| iGPU idle | 96.86 ms |
+| iGPU running real denoise | **97.88 ms** |
+| iGPU idle again | 96.91 ms |
+| **tax** | **1.01x** (the two idle blocks agree to 0.1%) |
+
+§K measured 1.74–1.76x and this section expected to inherit it. It does not
+transfer, and **§K's own mechanism is why**: §K tied the tax to sustained EU
+occupancy and package power — 2048² matmul at 22.4 W ruinous, 128² at 18.4 W
+free — and established that work which lets the device idle is not taxed. Real
+denoise on the iGPU is memory-bound at 29 GB/s; it stalls on DRAM and leaves the
+EU array idle, so it never triggers the mechanism. §K's rule was stated over
+*kernel duration*; this extends it to *arithmetic intensity*, which is the more
+general form: **what the iGPU costs the dGPU is a function of the iGPU's
+occupancy, not of how long it runs.**
+
+Consequence beyond ParaDiGMS: §K3 and §K4 were both rejected partly on ~+220 ms
+of contention. That component of the rejection does not apply to any
+*memory-bound* iGPU workload. Neither rejection turns over — §K4 still faces the
+<8% bandwidth ceiling and §M §3 now adds the granularity argument — but the
+reason has to be restated. §K2 (auxiliary lower-rate models) gets *cheaper*: if
+those models are memory-bound, they need no idle-window scheduling at all.
+
+### 5. What this changes
+
+| claim | before | after |
+|---|---|---|
+| ParaDiGMS on the model path | unmeasured, plausible from the K=10 batching curve | closed: 9 sweeps against a 2.19 break-even, **0.24x** |
+| the iGPU's `k` | one number, 12.9–15.4x (§K2), or "inside the cache ≈ 1" (§L §3) | a function of B: 4.75x at B=1 rising to 10.40x at B=4 |
+| why the iGPU cannot share the model path | bandwidth ceiling (§K4), reuse (§L §4) | **granularity** — one point costs more than the dGPU's whole sweep |
+| a busy iGPU costs the dGPU 1.75x | §K, measured with a 2048² matmul | only if the iGPU work is compute-bound; real denoise costs **1.01x** |
+
+### 6. Splitting *memory* instead of compute — the aggregate-bandwidth variant
+
+The natural follow-up, since the loop is memory-bound: give the iGPU a share of
+the **bytes** rather than a share of the points. Three things have to be said
+apart, because only the third is interesting.
+
+**Memory-bound here means bandwidth, not capacity.** The B60 holds 22.71 GiB and
+the model fits — a denoise step reads 3.91 GB, and §10's K=10 verify puts only
+422 MB of prefix KV alongside it. There is no capacity pressure to relieve, so
+moving capacity relieves nothing.
+
+**And the iGPU has no memory of its own** (§G): it shares LPDDR5 with the host.
+"Put some of the weights on the iGPU" is literally "put them in host DRAM", and
+then the dGPU reads them across PCIe instead of at 449 GB/s. No PCIe generation
+is within 7x of that. This variant makes the bound tighter, not looser.
+
+**The one that adds bandwidth** is expert sharding: each card reads its own
+experts from its own memory and the partial outputs are combined. That genuinely
+sums to 478 GB/s. Priced end to end:
+
+| | |
+|---|---|
+| ceiling, **upper bound** — see below | 213.5 x 449/478 = 200.6 ms, i.e. saves **at most 12.9 ms** |
+| balanced share for the iGPU | 29/478 = 6.1% of 75.5 MB = 4.6 MB ≈ **2 of 32 experts** |
+| exchanges required | one per layer-step: 36 layers x 10 steps = **360 round trips** |
+| payload | `[M=51, expert_hidden_size=768]` fp16 = **76.5 KiB** each way |
+| **measured round trip** | **0.155 ms** oneCCL, 0.166 ms shm (`phase10_ipc_probe.py --payloads moe_expert_shard_exchange`) |
+| transport total | 360 x 0.155 = **55.8 ms** |
+| **net** | **at best -42.9 ms. The transport costs at least 4.3x the gain.** |
+
+**The 12.9 ms is an upper bound, not an estimate**, and the distinction matters
+enough to state: it assumes the whole loop scales with aggregate bandwidth. It
+does not. The loop reads 39.1 GB in 213.5 ms — an effective **183 GB/s against
+the device's 449 GB/s peak, 41% of it** — because attention, the fused q/k/v, the
+router and the norms are 56% of a layer-step (§F2) and none of them is
+weight-streaming bound. Adding 29 GB/s of *peak* to a loop running at 41% of
+peak buys less than the peak-ratio arithmetic suggests. The rejection only gets
+stronger; the number is an upper bound and should be quoted as one.
+
+Stated as a requirement instead of a verdict: break-even needs the round trip at
+**0.036 ms or less**, and the best transport on this host measures 0.155. It
+would have to get 4.3x faster, and §9 already established that oneCCL's
+registered pt2pt path *is* the fast one here.
+
+#### Does the iGPU's 16 MiB cache rescue it? No — and §L already has the number
+
+The obvious save, since §L §3 measured up to 10.5x from cache residency and
+`k ≈ 1.01` inside it: **2 experts are 4.7 MB, which fits the 16 MiB cache** — §L's
+E=2 row, hot 0.0470 ms against cold 0.1827 ms.
+
+It does not work, for three reasons that stack.
+
+**§L's E is a per-layer-step footprint, not the share's.** A real split gives the
+iGPU 2 experts in *every* layer: `36 x 2 x 2.36 MB = 170 MB`. And the reuse to be
+captured is the one §L §4 identified — all 10 denoise steps re-read the same
+weights — which needs the whole share resident *simultaneously*. 170 MB against
+16.78 MB is **10x over**. §L's `cold` arm is exactly this case (it rotates a pool
+far larger than the cache, the loop's real reuse distance), and it reads
+**0.1827 ms at 25.8 GB/s** for E=2. That is the number this scheme gets, not the
+hot one.
+
+**Residency and a useful share are mutually exclusive.** To be resident the share
+must be <= 16.78 MB, which is **0.43%** of the 3.91 GB denoise step. To be worth
+splitting it must be ~6.1%, which is 238 MB — **14x apart**. There is no share
+size that is both.
+
+**And the cache is irrelevant anyway, because the loss is on the wire.** Put the
+transport next to the thing being offloaded:
+
+| | |
+|---|---|
+| one round trip | **0.155 ms** |
+| dGPU's **entire** 32-expert block, M=51 (`phase8_moe_gemm_probe.py`) | **0.251 ms** |
+
+The round trip costs **62% of the whole unit you are trying to split**. Handing
+over 2 of 32 experts saves the dGPU `0.251 x 2/32 = 0.0157 ms` and costs
+0.155 ms — 10x negative. The layer-step, with every number measured:
+
+    unsplit   dGPU 32 experts                                    0.251 ms
+    split     max(dGPU 30 = 0.235, iGPU 2 cold = 0.183) + 0.155 = 0.390 ms   1.55x worse
+    split, with the iGPU's side free (perfect cache hit)
+              max(dGPU 30 = 0.235, 0) + 0.155             = 0.390 ms   unchanged
+
+The third line is the point: **making the iGPU's half free changes nothing**,
+because the dGPU's remaining 30 experts already take longer than the iGPU's 2 and
+the round trip is pure addition. The cache can only shorten the side that is not
+the critical path.
+
+Equivalently, in closed form: break-even needs the iGPU to take a share whose
+*dGPU* cost exceeds 0.155 ms, i.e. `0.155/0.251 x 75.5 MB = 46.6 MB` — **62% of
+the experts**, which is **2.8x the cache** and lands at §L's E=8 row and beyond,
+the first one *past* the cliff (1.3x, 31 GB/s). Small enough to cache is too
+small to pay for the wire; big enough to pay for the wire is too big to cache.
+
+That is the same boundary §9 drew for the draft, from the other side. §G
+rejected the iGPU on "720 per-layer collectives"; §9 overturned it for
+speculative decoding because that topology pays **one round trip per tick, not
+720** — "切开的是草稿/验证这个职责，不是模型". Expert sharding splits the model,
+so it lands back on the rejected side, and 360 is the same order as 720.
+
+Two further reasons it is worse than the table, both already measured:
+
+* The +6.5% assumes the iGPU's 29 GB/s is reliably available. §L §6 measured its
+  throughput swinging **2.4x** with host CPU activity, because it is host LPDDR5.
+* §G's two-replica data-parallel run is this coupling measured end to end:
+  adding the iGPU took the dGPU from 246 to **336 ms/sample (37% slower)** and
+  aggregate throughput from 4.06 to 3.08 samples/s, "because the two contend for
+  host memory bandwidth and PCIe, and the iGPU has no memory of its own".
+
+**And that last point is what §4's 1.01x actually means.** The three numbers are
+not in conflict; they are three different things the iGPU can do to the dGPU:
+
+| what the iGPU is doing | cost to the dGPU | source |
+|---|---|---|
+| compute, stalled on its own 29 GB/s, EU array idle | **1.01x** | §M §4 |
+| compute **plus streaming weights from host memory** | **1.37x** | §G, two-replica DP |
+| saturating the EU array (2048² matmul) | 1.75x | §K |
+
+Expert sharding generates exactly the middle row's traffic. §4's 1.01x is cheap
+*because* the iGPU was stalling rather than moving bytes; a scheme whose whole
+purpose is to make it move bytes does not get to quote that number.
+
+So: closed, and for once not on `k` or granularity but on transport — the same
+arithmetic that let the draft through.
+
+### 7. What does work
+
+Nothing in the Steps table moves, and Phase 10's speculative round is untouched:
+it removes the same ten steps at 30.6 ms by verifying the *endpoint* rather than
+the *path*, which is why it is 3.2x cheaper than the cheapest possible ParaDiGMS
+sweep and 9x cheaper than a converged one. The two schemes are not variants of
+each other — in flow matching the intermediate `x_t` are scaffolding, not
+outputs, and ParaDiGMS pays to get them right.
 
 ## Rules
 

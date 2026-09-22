@@ -73,7 +73,47 @@ PAYLOADS = {
     "request_state": (55, torch.float32),
     "reply_x0_draft": (50 * 55, torch.float32),
     "refresh_prefix_kv": (286 * 512, torch.float16),
+    # Not a speculative-decoding payload. This is the *other* topology --
+    # sharding the MoE experts across both cards so each reads its own weights
+    # from its own memory, i.e. buying aggregate bandwidth rather than splitting
+    # a responsibility. One layer-step exchanges the expert block's activations
+    # both ways: `[M=51, expert_hidden_size=768]` fp16, 76.5 KiB. It is priced
+    # here because that scheme pays this **per layer-step** -- 36 layers x 10
+    # denoise steps = 360 round trips, against the at-most 12.9 ms that adding
+    # 29 GB/s to a 449 GB/s system can save (§G2's +6.5%, and an upper bound:
+    # the loop runs at 183 GB/s effective, 41% of peak).
+    # Measured 0.155 ms, so 55.8 ms of transport to buy <= 12.9 ms.
+    # See PHASE8_LATENCY_PARITY.md §M §6.
+    "moe_expert_shard_exchange": (51 * 768, torch.float16),
+    # Phase 13's topology: the iGPU runs the **real** 36-layer action-expert
+    # tower rather than a narrow draft head, so it needs the VLM's prefix K/V
+    # for every layer it attends over, not a 512-wide projection of it.
+    # 36 layers x 286 tokens x (8 kv heads x 128) x 2 (K and V) fp16 = 42.2 MB,
+    # which is the same 42.2 MB `_expand_rows` copies per verify row. Sent once
+    # per tick, because `spec_reground` re-grounds every tick.
+    # §9 priced this edge only up to 293 KiB; this is 147x that.
+    "reground_prefix_kv": (36 * 286 * 1024 * 2, torch.float16),
+    # The draft's conditioning in the same scheme: `embed_prefix`'s output,
+    # [286, 2560] fp16 = 1.46 MiB, available 22.6 ms into `_ground` and the
+    # reason the draft can overlap `prefix_forward` at all.
+    "reground_embs": (286 * 2560, torch.float16),
+    # Depth-pruned variants of the same edge: a draft that runs L of the 36
+    # expert layers only needs those layers' K/V. PHASE13 §5b's two live
+    # depths, measured rather than scaled, because the scaling is quoted.
+    "reground_prefix_kv_l24": (24 * 286 * 1024 * 2, torch.float16),
+    "reground_prefix_kv_l12": (12 * 286 * 1024 * 2, torch.float16),
 }
+
+# The three speculative-decoding payloads, and the default: they are what a tick
+# actually sends. `moe_expert_shard_exchange` is opt-in via `--payloads` because
+# **the oneCCL path hangs on a fourth payload in one process** -- three complete
+# and the fourth never returns from its first `send`. Reproduced from a clean
+# slate with the new payload in any position, and any three of the four run fine,
+# so it is a count limit (each payload registers two endpoints, so eight) and not
+# a property of a particular size. Not chased further: every payload here is
+# priced in one run of three, and the speculative runtime opens two endpoints
+# total. Raise it here only if some scheme needs four live channels at once.
+DEFAULT_PAYLOADS = ["request_state", "reply_x0_draft", "refresh_prefix_kv"]
 
 # onecclDataType_t / onecclResult_t, from oneapi/ccl/v2/types.h.
 ONECCL_SUCCESS = 0
@@ -428,7 +468,7 @@ def main() -> int:
     parser.add_argument("--shm-prefix", default="phase10ipc")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
-    parser.add_argument("--payloads", nargs="*", default=list(PAYLOADS))
+    parser.add_argument("--payloads", nargs="*", default=list(DEFAULT_PAYLOADS), choices=list(PAYLOADS))
     args = parser.parse_args()
 
     if args.role == "driver":
