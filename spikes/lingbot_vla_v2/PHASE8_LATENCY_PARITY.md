@@ -2672,15 +2672,24 @@ Six things here amend this document:
    concatenates freshly-computed suffix K/V onto the 286-token prefix cache 360
    times per request. Only the prefix is a cache.
 
-3. **§G5's bound was loose by 30x, in the direction that strengthens it.** §G5
-   priced row splitting at "at most ~13%" from the MoE GEMM's M-sweep. Measured
-   over the whole forward, with a same-code-path 51-row control to subtract the
-   probe's own overhead, halving the rows buys **+0.4%** (507.6 -> 505.7 ms).
-   The reason is §F1's, not §G5's: the loop is dispatch-bound, and halving the
-   rows removes no operator at all. So the sequence split hands away half its
-   work and keeps ~100% of its cost *before* any communication and *before* the
-   iGPU runs anything. Any scheme whose saving comes from fewer suffix rows per
-   forward is dead on arrival, second device or not.
+3. **§G5's bound holds on the compiled path — halving the rows buys 8.9%.**
+   §G5 priced row splitting at "at most ~13%" from the MoE GEMM's M-sweep.
+   Compiled, with a same-code-path control, 51 -> 26 rows is **196.1 -> 178.7 ms
+   (−17.4 ms, −8.9%)**. *(An earlier version of this item said §G5 was "loose by
+   30x", from the **eager** figure of +0.4%. Eager is launch-bound and reads flat;
+   that claim is withdrawn. It is the same eager-to-compiled trap as item 1, hit a
+   second time.)* The reason the saving stops near 9% is the MoE's shape: its
+   input is `[51, 768]`, three batch-32 GEMMs at arithmetic intensity M = 51,
+   already 4x below the machine balance of 207. Halving M halves the FLOPs and
+   leaves the 72 MiB/layer-step of expert weights exactly where they were. So
+   "ring attention lets the MoE GEMM run in parallel too" is true, and it is
+   worth 17.4 ms on the dGPU — while the iGPU's half, which must stream the same
+   replicated weights, costs **1663.6 ms compiled** (1505.3 ms even at one row).
+   Two gates, both measured: to stay off the critical path the second device
+   must stream 27.2 GB in ~179 ms, i.e. **≥ 152 GB/s** (the iGPU peaks at 29 and
+   achieves 18 compiled); and even a second device as fast as the dGPU loses,
+   because the 17.4 ms saving is less than the ring's 38.8 ms of wire — breaking
+   even needs **≤ 0.048 ms per exchange** against the measured 0.107.
 
 4. **Both splits are iGPU-compute-bound, not communication-bound — which is the
    opposite of what §G and §M.6 framed this class of scheme as.** Those sections
@@ -2723,12 +2732,14 @@ Six things here amend this document:
    cards (`--arm share-sweep`), the dGPU is flat in *both* dimensions — 1 prefix
    key costs what 286 do (299 vs 301 µs), 1 action row costs what 50 do (508 vs
    514 ms) — because at these shapes attention is **launch-bound, not
-   work-bound**. The iGPU's row curve saturates too, at **1704 ms** for a single
+   work-bound** (eager; see item 3 for the compiled rows). The iGPU's row curve
+   saturates too, at **1704 ms** eager / 1505 ms compiled for a single
    row, because sequence parallelism *replicates the weights*: a rank holding one
    row still streams all 36 layers' 2.72 GB per step, 27.2 GB per request, and
    27.2 GB / 29 GB/s = 937 ms is an arithmetic floor 4.4x above the 213.5 ms
-   target. So any arrangement that requires the iGPU to hold all 36 layers is
-   capped at 8x the target regardless of share or kernel quality; the only
+   target (compiled, the one-row figure is 1505.3 ms — 18 GB/s achieved). So any
+   arrangement that requires the iGPU to hold all 36 layers is capped at ~7x the
+   target regardless of share or kernel quality; the only
    direction that reduces the iGPU's *bytes* is splitting by layer (PHASE13 §5c
    priced that), not by row or by key. Fusion is not the missing piece either:
    `sdpa_attention` is 0.90x `eager_attention` at this shape, and a perfectly
@@ -2763,6 +2774,15 @@ query and output shapes, not by the KV split. That is the condition to watch if
 this is ever revisited: the benefit grows with context length, the payload does
 not, so a model in this family with a prefix an order of magnitude longer would
 move the ratio. At 286 tokens it is not close.
+
+**What to do instead**, ranked, is in PHASE14 §7 ("下一步"). In short: iGPU+dGPU
+sequence parallelism is not pursued, including a compiled two-process ring —
+neither gate above depends on the ring's implementation. The iGPU's one
+measured win remains Phase 10's speculative round (blocked on training the
+draft head). On the dGPU, the two levers these measurements point at are a fused
+suffix attention on the compiled path (bounded by the prefix's 33–35 ms) and int8
+expert weights (bounded by halving the 60.5 ms DRAM floor, blocked on the XPU
+quant kernels being 2D `mm` only — PHASE13 §0).
 
 ## Rules
 
