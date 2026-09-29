@@ -2784,6 +2784,93 @@ suffix attention on the compiled path (bounded by the prefix's 33–35 ms) and i
 expert weights (bounded by halving the 60.5 ms DRAM floor, blocked on the XPU
 quant kernels being 2D `mm` only — PHASE13 §0).
 
+## O. The break-even inequality that closes the whole family, 2026-09-23
+
+Phase 14 was the ninth dual-device arrangement priced one at a time. **Phase 15
+replaces the enumeration with one necessary condition**, and re-measured every
+term of it in `test-image_zy_scaler0260b2_lingbot_omni` on the compiled path.
+Full results in **`PHASE15_SP_BREAKEVEN.md`**; what this section owes the reader
+is the three numbers that change something above.
+
+**1. `k` is a property of the code path, not of the hardware, and every iGPU
+number in this document was eager.** Same rewritten forward, same day, both cards:
+
+| 51 rows x 10 steps | eager | compiled | speedup |
+|---|---:|---:|---:|
+| dGPU | 517.42 ms | **196.02** | **2.64x** |
+| iGPU | 2199.00 ms | **1834.72** | **1.20x** |
+| ⇒ `k` | **4.25x** | **9.36x** | |
+
+The eager 4.25 agrees with §M §5's `k(B=1) = 4.75`. Inductor fuses launch
+overhead, the dGPU is dispatch-bound (§F1) and the iGPU is not — it is stalled on
+29 GB/s, so it gets 20% where the dGPU gets 164%. **§K2's 12.9x came from a
+standalone MoE GEMM microbenchmark; 9.36x is the whole compiled loop and is the
+number to quote.** The consequence is the one worth carrying: **every time the
+dGPU gets faster, `k` gets larger and the second card's economics get worse.**
+§6's `num_steps` lever and PHASE9 §6's P2/P3/P5/P6/P7 all push in that direction.
+
+**2. The necessary condition, with four measured terms.** For any *exact* split of
+a parallel dimension inside the model, the cheapest possible crossing bill must be
+less than the best possible balanced-split gain:
+
+```
+             C · w      <      T / (1 + k)
+         360 × 0.109    <    206.22 / 10.36
+           39.24 ms     <       19.90 ms          FALSE, by 1.97x
+```
+
+`C = 360` is structural, not a design choice: attention reduces over keys so the
+partial `(out, lse)` must merge before `o_proj`, `forward_dense`'s `etd,te->td`
+reduces over experts so an expert split must merge before the residual add, and
+everything after both is nonlinear. The only splits with fewer crossings are
+sequential stages — layers, Euler steps — which have zero concurrency at B=1
+(PHASE13 §5c priced the closest real variant at 2.0x worse). Adding the measured
+iGPU invocation floor (0.3375 ms x 360) drops the gain to 8.18 ms, **4.80x
+short**. Break-even needs `k <= 4.26` with a free invocation, or `k <= 1.16` with
+the measured one — i.e. a second B60, not this iGPU. **The theorem is
+device-pair specific and must be stated that way.**
+
+**It is necessary, not sufficient, and that is how it is useful.** On the eager
+path it is *true* (39.24 < 88.85) while the measured eager SP is 0.18x — because
+`f* = 1/(1+k)` assumes perfect divisibility and sequence parallelism replicates
+weights. Only "false" is conclusive, and it is false on the compiled path. This
+is §8 ⑤ restated from a new angle: **computing this inequality on the eager path
+issues a false licence to try.**
+
+Its weakest assumption is *exactness*. `C >= 360` follows from bit-reconciling
+every layer-step; **asynchronous/stale/speculative schemes are not bound by it**,
+which is precisely the door Phase 10 walked through. Phase 15 did not exhaust
+that space and does not claim to.
+
+**3. Two single-card byproducts, both measured, both bigger than anything the
+second card was ever going to give.**
+
+* **The prefix-length curve is a sawtooth, and it is worth 16 ms.** 223 keys
+  (`Lk=274`) runs **16.0 ms faster than 214 keys** (`Lk=265`), three repeats,
+  spread ±0.16 ms — strictly more work, 7.8% faster. So at least 16 ms of the
+  206.22 ms baseline is kernel *configuration*, not work. §9's note that the
+  214→143 segment is non-linear and "没有追下去" is now chased. Direct
+  consequence: **PHASE9's P2 measures −18.2 ms, not the estimated −10.9**, and
+  its gain comes mostly from landing on the fast branch rather than from deleting
+  the 63 columns (46 columns buys −3.1 ms, 72 columns buys −2.3 ms, 63 buys
+  −18.2). PHASE9 §3 already requires the compacted length to be bucketed for
+  `dynamic=False` — **the bucket is therefore a free parameter worth 16 ms, and
+  it must be chosen by measurement, not by rounding up.** Mechanism not yet
+  identified (inductor autotune per shape, or a tiling cliff); 6 lengths only.
+* **`num_steps` is the largest single lever in this loop.** Compiled, 286 keys:
+  10 steps 206.22 ms, 4 steps 83.13, 2 steps 41.79 — strictly linear at
+  ~20.7 ms/step. **10 → 2 is −164.4 ms (4.93x) for a one-line config change.**
+  PHASE13 §223-240's ground-truth table says 2 steps is not worse than 10
+  (MAE(0-6) 0.0126 vs 0.0137), **but PHASE13 line 448 itself says that table's
+  sample is 6 episodes and must be expanded.** Largest lever, cheapest change,
+  accuracy evidence not yet sufficient — expanding the sweep is the next step.
+
+**What this changes above:** §N's compiled-path account is unaltered in direction
+and its three terms all reproduced; what changes is that it no longer needs to be
+recomputed per topology. **And the "-67 ms of costed, un-started single-card work"
+in PHASE9 §6 is now ~-66 to -68 ms with P2 re-priced upward — a third of the loop,
+against a second card that cannot produce 19.9 ms even in principle.**
+
 ## Rules
 
 Phase 5 and 6 rules carry over. Two that this phase will be tempted to break:
